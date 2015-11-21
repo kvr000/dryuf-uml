@@ -1,0 +1,1381 @@
+#!/usr/bin/perl
+
+#
+# Dryuf framework
+#
+# ----------------------------------------------------------------------------------
+#
+# Copyright (C) 2000-2015 Zbyněk Vyškovský
+#
+# ----------------------------------------------------------------------------------
+#
+# LICENSE:
+#
+# This file is part of Dryuf
+#
+# Dryuf is free software; you can redistribute it and/or modify it under the
+# terms of the GNU Lesser General Public License as published by the Free
+# Software Foundation; either version 3 of the License, or (at your option)
+# any later version.
+#
+# Dryuf is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+# more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Dryuf; if not, write to the Free Software Foundation, Inc., 51
+# Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# @author	2000-2015 Zbyněk Vyškovský
+# @link		mailto:kvr@matfyz.cz
+# @link		http://kvr.matfyz.cz/software/java/dryuf/
+# @link		http://github.com/dryuf/
+# @license	http://www.gnu.org/licenses/lgpl.txt GNU Lesser General Public License v3
+#
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Data::Dumper;
+use Getopt::Std;
+
+use File::Basename;
+use File::Find;
+use lib dirname($0)."/perl";
+use net::dryuf::uml::FileTransaction;
+use net::dryuf::uml::FileParser;
+use net::dryuf::uml::ModelStore;
+use net::dryuf::uml::TagWriter;
+use net::dryuf::uml::Util qw(tabalign escapeString makeLineEnd indentString textToString escapeStringContent convertBool);
+use net::dryuf::uml::prog::java::JavaGenerator;
+use net::dryuf::uml::prog::java::JavaOutFileContext;
+use net::dryuf::uml::prog::java::JavaOutputGenerator;
+use net::dryuf::uml::prog::gen::CopyGenerator;
+
+
+our %opts;
+our $file_trans;
+
+
+sub convertToJavaClass
+{
+	my $classname			= shift;
+
+	$classname =~ s/::/./g;
+
+	return $classname;
+}
+
+sub escapeJavaTypeValue
+{
+	my $java_type			= shift;
+	my $value			= shift;
+
+	return "${value}L" if ($java_type eq "Long");
+	return escapeStringContent($value) if ($java_type eq "String");
+	return $value ? "true" : "false" if ($java_type eq "Boolean");
+	return $value;
+}
+
+sub translateJavaType # translatedString <- importCtx baseModel javaType-string
+{
+	my $importCtx			= shift;
+	my $baseModel			= shift;
+	my $javaType			= shift;
+
+	if (!defined $javaType->{type}) {
+		return $javaType->getFullDotName();
+	}
+	elsif ($javaType->{type} =~ m/^((\w+\.)*\w+)\s*<\s*(.*)\s*>$/) {
+		my $structBase = $1;
+		my $elementType = $3;
+		if ($structBase !~ m/\./) {
+			$importCtx->printOnce("import ".net::dryuf::uml::prog::java::JavaGenerator::mapJavaDatastruct($structBase).";\n");
+		}
+		my $elementName;
+		if ($elementType eq ".") {
+			$elementName = $baseModel->getFullDotName();
+		}
+		else {
+			$elementName = net::dryuf::uml::prog::java::JavaGenerator::mapJavaPlain($baseModel, $elementType);
+		}
+		return "$structBase<$elementName>";
+	}
+	else {
+		net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($javaType);
+	}
+}
+
+sub getDataSource($)
+{
+	my $classdef			= shift;
+
+	return $classdef->checkDryTagHierarchicalValue("datasource") || net::dryuf::uml::Util::doDie("failed to find datasource for class $classdef->{name}");
+}
+
+sub getDaoContextBase($)
+{
+	my $classdef			= shift;
+
+	return $classdef->checkDryTagHierarchicalValue("daobase") || net::dryuf::uml::Util::doDie("failed to find daobase for class $classdef->{name}");
+}
+
+sub hasComplexPrimary($)
+{
+	my $model			= shift;
+
+	my @primary = $model->getPrimary();
+	return @primary > 1;
+}
+
+sub convertPkType($)
+{
+	my $model			= shift;
+
+	my @primary = $model->getPrimary();
+	if (@primary > 1) {
+		return $model->{name}.".Pk";
+	}
+	else {
+		return net::dryuf::uml::prog::java::JavaGenerator::mapJavaAttrType($primary[0]);
+	}
+}
+
+sub isPkPrimitive($)
+{
+	my $model			= shift;
+
+	my @primary = $model->getPrimary();
+	return @primary <= 1;
+}
+
+sub getFieldDefault($$$)
+{
+	my $context			= shift;
+	my $field			= shift;
+	my $javaType			= shift;
+
+	my $dfl = (defined $field->{default}) ?
+		escapeJavaTypeValue($javaType, $field->{default}) :
+		(defined $field->checkDryTagValue("doMandatory")) ? escapeJavaTypeValue($javaType, $field->checkDryTagValue("doMandatory")) :
+		undef;
+
+	return $dfl;
+}
+
+sub forceFieldDefault($$$)
+{
+	my $context			= shift;
+	my $field			= shift;
+	my $javaType			= shift;
+
+	my $dfl = getFieldDefault($context, $field, $javaType);
+	if (!defined $dfl) {
+		$dfl = net::dryuf::uml::prog::java::JavaGenerator::isJavaTypePrimitive($javaType) ? $javaType eq "boolean" ? "false" : "0" : "null";
+	}
+
+	return $dfl;
+}
+
+sub formatSeparatingComma
+{
+	my $ctx				= shift;
+	my $counterRef			= shift;
+
+	$ctx->printPlain(", ") if ($$counterRef++ > 0);
+}
+
+sub printPrimitiveAnnotations($$$$$$$)
+{
+	my $context			= shift;
+	my $javaOut			= shift;
+	my $printCtx			= shift;
+	my $model			= shift;
+	my $field			= shift;
+	my $tagger			= shift;
+	my $javaType			= shift;
+
+	if (defined (my $logical = $tagger->checkTagValue("logical"))) {
+		$javaOut->printSysimport("import net.dryuf.logical.LogicalUse;\n");
+		$printCtx->print("\@LogicalUse(logical = ".convertToJavaClass($logical).".class)\n");
+	}
+	if (defined (my $display = $tagger->checkTagValue("display"))) {
+		$javaOut->printSysimport("import net.dryuf.logical.DisplayUse;\n");
+		my $displayAdd = "";
+		#if ($field->{stype} eq "assoc") {
+		#	$displayAdd .= ", refClass = ".$field->getAssocTarget()->getFullDotName().".class";
+		#}
+		$printCtx->print("\@DisplayUse(display = \"".escapeString($display)."\"$displayAdd)\n");
+	}
+	$javaOut->printSysimport("import net.dryuf.meta.FieldRoles;\n");
+	$printCtx->print("\@FieldRoles(".net::dryuf::uml::prog::java::JavaGenerator::formatFieldRoles($model, $field).")\n");
+	if (
+		defined (my $refBasePath = $tagger->checkTagValue("refBasePath")) |
+		defined (my $refLoadAction = $tagger->checkTagValue("refLoadAction")) |
+		defined (my $refListAllAction = $tagger->checkTagValue("refListAllAction")) |
+		defined (my $refListNewAction = $tagger->checkTagValue("refListNewAction")) |
+		defined (my $refListSetAction = $tagger->checkTagValue("refListSetAction"))
+	) {
+		my $counter = 0;
+		$javaOut->printSysimport("import net.dryuf.meta.ReferenceDef;\n");
+		$printCtx->print("\@ReferenceDef(");
+		formatSeparatingComma($printCtx, \$counter), $printCtx->printPlain("basePath = \"".escapeStringContent($refBasePath)."\"") if (defined $refBasePath);
+		formatSeparatingComma($printCtx, \$counter), $printCtx->printPlain("loadAction = \"".escapeStringContent($refLoadAction)."\"") if (defined $refLoadAction);
+		formatSeparatingComma($printCtx, \$counter), $printCtx->printPlain("listAllAction = \"".escapeStringContent($refListAllAction)."\"") if (defined $refListAllAction);
+		formatSeparatingComma($printCtx, \$counter), $printCtx->printPlain("listNewAction = \"".escapeStringContent($refListNewAction)."\"") if (defined $refListNewAction);
+		formatSeparatingComma($printCtx, \$counter), $printCtx->printPlain("listSetAction = \"".escapeStringContent($refListSetAction)."\"") if (defined $refListSetAction);
+		$printCtx->printPlain(")\n");
+	}
+}
+
+sub printFieldDef($$$$$$$)
+{
+	my $context			= shift;
+	my $javaOut			= shift;
+	my $printCtx			= shift;
+	my $model			= shift;
+	my $field			= shift;
+	my $tagger			= shift;
+	my $javaType			= shift;
+
+	if ($field->{stype} eq "assoc") {
+		$javaOut->printSysimport("import net.dryuf.meta.AssocDef;\n");
+		$javaOut->printSysimport("import net.dryuf.app.FieldDef;\n");
+		$printCtx->print("\@AssocDef(assocType = FieldDef.AST_Reference, target = ".$field->getAssocTarget()->getFullDotName().".class)\n");
+	}
+	printPrimitiveAnnotations($context, $javaOut, $printCtx, $model, $field, $tagger, $javaType);
+	$javaOut->printSysimport("import net.dryuf.meta.Mandatory;\n");
+	$printCtx->print("\@Mandatory(mandatory = ".net::dryuf::uml::prog::java::JavaGenerator::formatBoolean($field->{mandatory}).(defined $field->checkDryTagValue("doMandatory") ? ", doMandatory = \"".escapeString($field->checkDryTagValue("doMandatory"))."\"" : "").")\n");
+
+	my $dfl = getFieldDefault($context, $field, $javaType);
+	$dfl = defined $dfl ? " = ".$dfl : "";
+
+	$printCtx->print(tabalign("protected $javaType", 32)."$field->{name}$dfl;\n\n");
+}
+
+sub generateEntityBeanPart($$$)
+{
+	my $context			= shift;
+	my $javaOut			= shift;
+	my $model			= shift;
+
+	my $codeCtx			= $javaOut->{codeCtx};
+
+	my $classname = $model->{name};
+	my $jclassname = $classname; $jclassname =~ s/::/./g;
+	my $filename = $jclassname; $filename =~ s/\./\//g;
+	my $pkgname = $jclassname; $pkgname =~ s/\.\w+$//;
+	my $classonly = $jclassname; $classonly =~ s/^.*\.//g;
+
+	my @primary = $model->getPrimary();
+
+	my $usePk = @primary > 1;
+
+	my $dao = $model->checkSubModel("${classname}::Dao");
+
+	$javaOut->printSysimport("import javax.persistence.Entity;\n");
+	$javaOut->printSysimport("import javax.persistence.Table;\n");
+
+	my $clsCtx = $codeCtx->subContext();
+	if (defined (my $roleProcessor = ($dao && $dao->checkDryTagValue("roleProcessor")) // $model->checkDryTagValue("roleProcessor"))) {
+		$javaOut->printSysimport("import net.dryuf.dao.RoleProcessorUse;\n");
+		$codeCtx->print("\@RoleProcessorUse(roleProcessor = ".convertToJavaClass($roleProcessor).".class)\n");
+	}
+	$javaOut->printSysimport("import net.dryuf.meta.ViewsList;\n");
+	$codeCtx->print("\@ViewsList(views = {\n");
+	if (!@{$model->{view_list}}) {
+		$javaOut->printSysimport("import net.dryuf.meta.ViewInfo;\n");
+		$codeCtx->print("\t\@ViewInfo(name = \"Default\"),\n");
+	}
+	foreach my $view (@{$model->{view_list}}) {
+		$javaOut->printSysimport("import net.dryuf.meta.ViewInfo;\n");
+		$codeCtx->print("\t\@ViewInfo(name = \"$view->{name}\"");
+		eval {
+			foreach (qw(supplier renderer clientClass)) { # (qw(nocompos suggest supplier renderer addcompos iniclass gui_filter view_fields))
+				if (defined (my $v = $view->checkDryTagValue($_))) {
+					$codeCtx->print(", $_ = \"$v\"");
+				}
+			}
+			foreach (qw(fields actions)) {
+				if (defined (my $v = $view->checkDryTagValue($_))) {
+					$codeCtx->print(", $_ = { ".join(", ", map({ textToString($_) } split(/,\s*/, $v)))." }");
+				}
+			}
+			1;
+		}
+			or net::dryuf::uml::Util::doDie("failed to process view $model->{full}.$view->{name}:\n$@");
+		$codeCtx->print("),\n");
+	}
+	$codeCtx->replaceOptionalEnd(",\n", "\n");
+	$codeCtx->print("})\n");
+
+	if (defined (my $suggestFields = $model->checkDryTagValue("suggestFields"))) {
+		$javaOut->printSysimport("import net.dryuf.meta.SuggestDef;\n");
+		$codeCtx->print("\@SuggestDef(fields = { ".join(", ", map({ "\"$_\"" } split(/,\s*/, $suggestFields)))." })\n");
+	}
+	if (defined (my $displayFields = $model->checkDryTagValue("displayKeys"))) {
+		$javaOut->printSysimport("import net.dryuf.meta.DisplayKeysDef;\n");
+		$codeCtx->print("\@DisplayKeysDef(fields = { ".join(", ", map({ "\"$_\"" } split(/,\s*/, $displayFields)))." })\n");
+	}
+	if (defined (my $refFields = $model->checkDryTagValue("refFields"))) {
+		$javaOut->printSysimport("import net.dryuf.meta.RefFieldsDef;\n");
+		$codeCtx->print("\@RefFieldsDef(fields = { ".join(", ", map({ "\"$_\"" } split(/,\s*/, $refFields)))." })\n");
+	}
+	if (defined (my $orderFields = $model->checkDryTagValue("orderBy"))) {
+		$javaOut->printSysimport("import net.dryuf.meta.ListOrder;\n");
+		$codeCtx->print("\@ListOrder(order = { ".join(", ", map({ "\"$_\"" } split(/,\s*/, $orderFields)))." })\n");
+	}
+	$javaOut->printSysimport("import net.dryuf.meta.FieldRoles;\n");
+	$codeCtx->print("\@FieldRoles(".net::dryuf::uml::prog::java::JavaGenerator::formatClassRoles($model).")\n");
+	$codeCtx->print("\@Entity\n\@Table(name = \"$classonly\")\npublic class $classonly implements java.io.Serializable".
+		join("", map({ s/::/./g; $_ .= "<$classonly>" if ($_ eq "java.lang.Comparable"); ", ".$_; } @{$model->{implements}}))
+		."\n{\n");
+	my $inner = $codeCtx->indentContext(1);
+	$inner->print(tabalign("private static final long", 32)."serialVersionUID = 1L;\n\n");
+	my $nested_out = $javaOut->dupWithFileContext($inner->subContext());
+
+	my $pkCtx;
+	my $pk_fieldCtx;
+	my $pk_methodCtx;
+	my $pk_endCtx;
+	$pkCtx = $inner->subContext();
+	$pk_fieldCtx = $pkCtx->subAfterContext()->indentContext(1);
+	$pk_methodCtx = $pkCtx->subAfterContext()->indentContext(1);
+	$pk_endCtx = $inner->subContext();
+
+	$inner->print("\n");
+	my $fieldCtx = $inner->subContext();
+	$inner->print("\n");
+	my $methodCtx = $inner->subContext();
+
+	my $fieldOrder = "";
+	my $pkOrder = "";
+	my $relations = "";
+
+	foreach my $nested_name (@{$model->getNestedNames()}) {
+		#STDERR->print("processing nested $nested_name\n");
+		my $nested = $model->checkSubModel("$model->{full}::$nested_name")
+			or net::dryuf::uml::Util::doDie("failed to load nested class $model->{full}::$nested_name");
+		if ($nested->{stype} eq "enum") {
+			net::dryuf::uml::prog::java::JavaOutputGenerator->new($nested_out)->generateNested($nested);
+			$nested_out->printCode("\n");
+		}
+	}
+
+	my $pkClazz = undef;
+	my $pkField = "";
+	my $addPkFields = "";
+	my $composClazz = undef;
+	my $composPkClazz = undef;
+	my $composField = undef;
+
+	if ($usePk) {
+		$fieldOrder .= ", \"pk\"";
+	}
+
+	foreach my $field (@{$model->getAttrs()}) {
+		# $primaryLevel identifies whether this field is not part of primary key (-1), is a simple primary key (0) or part of complex primary key (1)
+		my $primaryLevel = $field->getRole()->{primary} ? @primary > 1 : -1;
+		if ($field->{stype} eq "field") {
+			my ( $type, $tagger ) = $field->getFinalTypeWithTagger();
+			my $java_type = net::dryuf::uml::prog::java::JavaGenerator::mapJavaAttrType($field);
+			if ($field->checkDryTagValue("transient")) {
+				$fieldCtx->print(tabalign("protected transient $java_type", 32).$field->{name}.";\n");
+			}
+			else {
+				my $method = ucfirst($field->{name});
+				$javaOut->printSysimport("import javax.persistence.Column;\n");
+				my $tmap = "";
+				$tmap .= "\@Column(name = \"".$field->{name}."\")\n";
+				if ($field->checkDryTagValue("serial")) {
+					$javaOut->printSysimport("import javax.persistence.GenerationType;\n");
+					$javaOut->printSysimport("import javax.persistence.GeneratedValue;\n");
+					$tmap .= "\@GeneratedValue(strategy = GenerationType.AUTO)\n";
+				}
+				if ($primaryLevel > 0) {
+					$addPkFields .= "\"$field->{name}\", ";
+					$pk_fieldCtx->print($tmap);
+					printFieldDef($context, $javaOut, $pk_fieldCtx, $model, $field, $tagger, $java_type);
+					$pkOrder .= ", \"".escapeString($field->{name})."\"";
+				}
+				elsif ($primaryLevel == 0) {
+					$fieldCtx->print($tmap);
+					$javaOut->printSysimport("import javax.persistence.Id;\n");
+					$fieldCtx->print("\@Id\n");
+					printFieldDef($context, $javaOut, $fieldCtx, $model, $field, $tagger, $java_type);
+					$pkClazz = "$java_type";
+					$pkField = $field->{name};
+					$fieldOrder .= ", \"".escapeString($field->{name})."\"";
+				}
+				else {
+					$fieldCtx->print($tmap);
+					printFieldDef($context, $javaOut, $fieldCtx, $model, $field, $tagger, $java_type);
+					$fieldOrder .= ", \"".escapeString($field->{name})."\"";
+				}
+				if ($primaryLevel == 0) {
+					$methodCtx->print(tabalign("public $java_type", 32)."getPk()\n{\n\treturn $field->{name};\n}\n\n");
+					$methodCtx->print(tabalign("public void", 32)."setPk($java_type $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+				}
+				if ($primaryLevel > 0) {
+					$methodCtx->print(tabalign("public void", 32)."set$method($java_type $field->{name}_)\n{\n\tthis.pk.set".ucfirst($field->{name})."($field->{name}_);\n}\n\n");
+					$methodCtx->print(tabalign("public $java_type", 32)."get$method()\n{\n\treturn this.pk.get".ucfirst($field->{name})."();\n}\n\n");
+					$pk_methodCtx->print(tabalign("public void", 32)."set$method($java_type $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+					$pk_methodCtx->print(tabalign("public $java_type", 32)."get$method()\n{\n\treturn this.$field->{name};\n}\n\n");
+				}
+				else {
+					$methodCtx->print(tabalign("public void", 32)."set$method($java_type $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+					$methodCtx->print(tabalign("public $java_type", 32)."get$method()\n{\n\treturn this.$field->{name};\n}\n\n");
+				}
+			}
+		}
+		elsif ($field->{stype} eq "child") {
+			my $assoc_class = $field->getAssocTarget();
+			if ($field->checkDryTagValue("tied")) {
+				$javaOut->printAppimport("import ".convertToJavaClass($assoc_class->{full}).";\n");
+				$javaOut->printSysimport("import javax.persistence.OneToMany;\n");
+				$javaOut->printSysimport("import javax.persistence.JoinColumns;\n");
+				$javaOut->printSysimport("import javax.persistence.JoinColumn;\n");
+				$javaOut->printSysimport("import javax.persistence.FetchType;\n");
+				$javaOut->printSysimport("import javax.persistence.CascadeType;\n");
+				$javaOut->printSysimport("import java.util.Set;\n");
+				$javaOut->printSysimport("import java.util.HashSet;\n");
+				$javaOut->printSysimport("import net.dryuf.meta.AssocDef;\n");
+				$javaOut->printSysimport("import net.dryuf.app.FieldDef;\n");
+				$fieldCtx->print("\@AssocDef(assocType = FieldDef.AST_Children, target = ".$assoc_class->getFullDotName().".class)\n");
+				my $tmap = "";
+				my $loadTime = $field->checkDryTagValue("loadTime") || "LAZY";
+				$tmap .= "\@OneToMany(fetch = FetchType.$loadTime, cascade = CascadeType.ALL)\n";
+				$tmap .= "\@JoinColumns({ ".
+					join(", ", map({ "\@JoinColumn(name = \"$_->{name}\", referencedColumnName = \"$_->{name}\")" } $assoc_class->getCompos()->expandAssocAttrs())).
+					" })\n";
+				if (defined (my $orderBy = $assoc_class->checkDryTagValue("orderBy"))) {
+					$javaOut->printSysimport("import javax.persistence.OrderBy;\n");
+					$tmap .= "\@OrderBy(value = \"".escapeString($orderBy)."\")\n";
+				}
+				$fieldCtx->print($tmap);
+				$fieldCtx->print(tabalign("private Set<$assoc_class->{name}>", 32)."$field->{name} = new HashSet<$assoc_class->{name}>();\n\n");
+				$methodCtx->print(tabalign("public Set<$assoc_class->{name}>", 32)."get".ucfirst($field->{name})."()\n{\n\treturn $field->{name};\n}\n\n");
+				$methodCtx->print(tabalign("public void", 32)."set".ucfirst($field->{name})."(Set<$assoc_class->{name}> $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+				$fieldOrder .= ", \"".escapeString($field->{name})."\"";
+			}
+			$relations .= "\t\@RelationDef(name = \"$field->{name}\", targetClass = ".textToString($assoc_class->getFullDotName())."),\n";
+		}
+		elsif ($field->{stype} eq "assoc") {
+			my ( $type, $tagger ) = $field->getFinalTypeWithTagger();
+			my $java_type = net::dryuf::uml::prog::java::JavaGenerator::mapJavaAttrType($field);
+			my $method = ucfirst($field->{name});
+			$javaOut->printSysimport("import javax.persistence.Column;\n");
+			my $tmap = "";
+			$tmap .= "\@Column(name = \"".$field->{name}."\")\n";
+			if ($field->checkDryTagValue("serial")) {
+				$javaOut->printSysimport("import javax.persistence.GenerationType;\n");
+				$javaOut->printSysimport("import javax.persistence.GeneratedValue;\n");
+				$tmap .= "\@GeneratedValue(strategy = GenerationType.AUTO)\n";
+			}
+			my $dfl = (defined $field->{default}) ?
+				" = ".escapeJavaTypeValue($java_type, $field->{default}) :
+				(defined $field->checkDryTagValue("doMandatory")) ? " = ".escapeJavaTypeValue($java_type, $field->checkDryTagValue("doMandatory")) :
+				"";
+			if ($primaryLevel > 0) {
+				$addPkFields .= "\"$field->{name}\", ";
+				printFieldDef($context, $javaOut, $pk_fieldCtx, $model, $field, $tagger, $java_type);
+				$pkOrder .= ", \"".escapeString($field->{name})."\"";
+			}
+			elsif ($primaryLevel == 0) {
+				$fieldCtx->print($tmap);
+				$javaOut->printSysimport("import javax.persistence.Id;\n");
+				$fieldCtx->print("\@Id\n");
+				printFieldDef($context, $javaOut, $fieldCtx, $model, $field, $tagger, $java_type);
+				$fieldOrder .= ", \"".escapeString($field->{name})."\"";
+			}
+			else {
+				$fieldCtx->print($tmap);
+				printFieldDef($context, $javaOut, $fieldCtx, $model, $field, $tagger, $java_type);
+				$fieldOrder .= ", \"".escapeString($field->{name})."\"";
+			}
+			if ($primaryLevel == 0) {
+				$methodCtx->print(tabalign("public $java_type", 32)."getPk()\n{\treturn $field->{name};\n}\n\n");
+				$methodCtx->print(tabalign("public void", 32)."setPk($java_type $field->{name}_)\n{\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+			}
+			if ($primaryLevel > 0) {
+				$methodCtx->print(tabalign("public void", 32)."set$method($java_type $field->{name}_)\n{\n\tthis.pk.set".ucfirst($field->{name})."($field->{name}_);\n}\n\n");
+				$methodCtx->print(tabalign("public $java_type", 32)."get$method()\n{\n\treturn this.pk.get".ucfirst($field->{name})."();\n}\n\n");
+				$pk_methodCtx->print(tabalign("public void", 32)."set$method($java_type $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+				$pk_methodCtx->print(tabalign("public $java_type", 32)."get$method()\n{\n\treturn this.$field->{name};\n}\n\n");
+			}
+			else {
+				$methodCtx->print(tabalign("public void", 32)."set$method($java_type $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+				$methodCtx->print(tabalign("public $java_type", 32)."get$method()\n{\n\treturn this.$field->{name};\n}\n\n");
+			}
+		}
+		elsif ($field->{stype} eq "compos") {
+			my $compos = $field->getAssocTarget();
+			$composClazz = convertToJavaClass($compos->{full});
+			my $pktype = convertPkType($compos);
+			#$javaOut->printSysimport("import net.dryuf.meta.ComposDef;\n");
+			#$clsCtx->print("\@ComposDef(clazz = ".$compos->getFullDotName().".class, pkclazz = ".convertPkType($compos).".class, path = \"pk.$field->{name}\", composKeySetter = \"set".ucfirst($field->{name})."\")\n");
+			$composField = $field->{name};
+			$composPkClazz = convertPkType($compos);
+			$javaOut->printSysimport("import net.dryuf.meta.Mandatory;\n");
+			if ($primaryLevel > 0) {
+				$pk_fieldCtx->print("\@Mandatory(mandatory = true)\n");
+				$pk_fieldCtx->print("\@Column(name = \"$field->{name}\")\n");
+				if (isPkPrimitive($compos)) {
+					my @composPrimary = $compos->getPrimary();
+					my ( $composPkType, $composPkTagger ) = $composPrimary[0]->getFinalTypeWithTagger();
+					printPrimitiveAnnotations($context, $javaOut, $pk_fieldCtx, $model, $field, $composPkTagger, $pktype)
+				}
+				else {
+					$pk_fieldCtx->print("\@FieldRoles(".net::dryuf::uml::prog::java::JavaGenerator::formatFieldRoles($model, $field).")\n");
+					$javaOut->printSysimport("import javax.persistence.Embedded;\n");
+					$pk_fieldCtx->print("\@Embedded\n");
+				}
+				$pk_fieldCtx->print(tabalign("protected $pktype", 32)."$field->{name};\n\n");
+				$methodCtx->print(tabalign("public void", 32)."set".ucfirst($field->{name})."($pktype $field->{name}_)\n{\n\tthis.pk.set".ucfirst($field->{name})."($field->{name}_);\n}\n\n");
+				$methodCtx->print(tabalign("public $pktype", 32)."get".ucfirst($field->{name})."()\n{\n\treturn this.pk.get".ucfirst($field->{name})."();\n}\n\n");
+				$pk_methodCtx->print(tabalign("public void", 32)."set".ucfirst($field->{name})."($pktype $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+				$pk_methodCtx->print(tabalign("public $pktype", 32)."get".ucfirst($field->{name})."()\n{\n\treturn this.$field->{name};\n}\n\n");
+				$pkOrder .= ", \"".escapeString($field->{name})."\"";
+			}
+			else {
+				$fieldCtx->print("\@Mandatory(mandatory = true)\n");
+				if ($primaryLevel == 0) {
+					$javaOut->printSysimport("import javax.persistence.EmbeddedId;\n");
+					$fieldCtx->print("\@EmbeddedId\n");
+				}
+				if (isPkPrimitive($compos)) {
+					my @composPrimary = $compos->getPrimary();
+					my ( $composPkType, $composPkTagger ) = $composPrimary[0]->getFinalTypeWithTagger();
+					$fieldCtx->print("\@Column(name = \"$field->{name}\")\n");
+					printPrimitiveAnnotations($context, $javaOut, $fieldCtx, $model, $field, $composPkTagger, $pktype)
+				}
+				else {
+					$fieldCtx->print("\@FieldRoles(".net::dryuf::uml::prog::java::JavaGenerator::formatFieldRoles($model, $field).")\n");
+				}
+				$fieldCtx->print(tabalign("protected $pktype", 32)."$field->{name};\n\n");
+				$methodCtx->print(tabalign("public void", 32)."set".ucfirst($field->{name})."($pktype $field->{name}_)\n{\n\tthis.$field->{name} = $field->{name}_;\n}\n\n");
+				$methodCtx->print(tabalign("public $pktype", 32)."get".ucfirst($field->{name})."()\n{\n\treturn this.$field->{name};\n}\n\n");
+				$fieldOrder .= ", \"".escapeString($field->{name})."\"";
+			}
+		}
+		else {
+			net::dryuf::uml::Util::doDie("unknown field stype: $field->{name} -> $field->{stype}");
+		}
+	}
+	if ($usePk) {
+		$javaOut->printSysimport("import javax.persistence.EmbeddedId;\n");
+		$javaOut->printSysimport("import javax.persistence.Embeddable;\n");
+		$javaOut->printSysimport("import java.io.Serializable;\n");
+		$javaOut->printSysimport("import net.dryuf.meta.FieldOrder;\n");
+		$pkCtx->print("\@FieldOrder(fields = { ".substr($pkOrder, 2)." })\n");
+		$pkCtx->print("\@FieldRoles(".net::dryuf::uml::prog::java::JavaGenerator::formatClassRoles($model).")\n");
+		$pkCtx->print("\@Embeddable\npublic static class Pk implements Serializable\n{\n");
+		$pkCtx->print("\t".tabalign("private static final long serialVersionUID", 32)."= 1L;\n\n");
+		my $inpkCtx = $pk_endCtx->indentContext(1);
+		my $hash_cont = "0";
+		my $equals_cont = "true";
+		foreach my $pka (@primary) {
+			my $java_type = $pka->{stype} eq "compos" ? "Compos" : net::dryuf::uml::prog::java::JavaGenerator::mapJavaAttrType($pka);
+			$hash_cont = "($hash_cont)*37+";
+			$hash_cont .= net::dryuf::uml::prog::java::JavaGenerator::isJavaTypePrimitive($java_type) ? $java_type eq "int" ? $pka->{name} : "(int)$pka->{name}" : "($pka->{name} == null ? 0 : $pka->{name}.hashCode())";
+			$equals_cont .= net::dryuf::uml::prog::java::JavaGenerator::isJavaTypePrimitive($java_type) ? " && ($pka->{name} == s.$pka->{name})" : " && ($pka->{name} == null ? s.$pka->{name} == null : $pka->{name}.equals(s.$pka->{name}))";
+		}
+		$inpkCtx->print("\@net.dryuf.trans.meta.NoDynamic\n".tabalign("public", 32)."Pk()\n{\n}\n\n");
+		$inpkCtx->print("\@net.dryuf.trans.meta.DynamicDefaults(defaults = { ".join(", ", map({ "\"".escapeString(forceFieldDefault($context, $_, $_->{stype} eq "compos" ? "Compos" : net::dryuf::uml::prog::java::JavaGenerator::mapJavaAttrType($_)))."\""; } @primary))." })\n");
+		$inpkCtx->print(tabalign("public", 32)."Pk(".join(", ", map({ $_->{stype} eq "compos" ? (convertPkType($_->getAssocTarget())." $_->{name}") : (net::dryuf::uml::prog::java::JavaGenerator::mapJavaAttrType($_)." $_->{name}"); } @primary)).")\n");
+		$inpkCtx->print("{\n");
+		foreach my $pka (@primary) {
+			$inpkCtx->print("\t"."this.$pka->{name} = $pka->{name};\n");
+		}
+		$inpkCtx->print("}\n\n");
+		$inpkCtx->print("\@Override\n".tabalign("public int", 32)."hashCode()\n{\n");
+		$inpkCtx->print("\treturn $hash_cont;\n");
+		$inpkCtx->print("}\n\n");
+		$inpkCtx->print("\@Override\n".tabalign("public boolean", 32)."equals(Object o)\n{\n");
+		$inpkCtx->print("\tif (!(o instanceof Pk))\n\t\treturn false;\n\tPk s = (Pk)o;\n");
+		$inpkCtx->print("\treturn $equals_cont;\n");
+		$inpkCtx->print("}\n\n");
+		$pk_endCtx->print("}\n");
+		$pk_endCtx->print("\n\@EmbeddedId\n".tabalign("protected Pk", 32)."pk = new Pk();\n\n");
+		$methodCtx->print(tabalign("public Pk", 32)."getPk()\n{\n\treturn pk;\n}\n\n");
+		$methodCtx->print(tabalign("public void", 32)."setPk(Pk pk_)\n{\n\tthis.pk = pk_;\n}\n\n");
+		$pkClazz = "$classonly.Pk";
+		$pkField = "pk";
+	}
+
+	foreach my $method (grep({ substr($_->{name}, 0, 3) ne "net.dryuf." } @{$model->getOperations()})) {
+		if (defined (my $code = $method->checkDryTagValue("javaCode"))) {
+			$code .= "\n" unless ($code =~ m/\n/s);
+			my $ret_type = $method->checkDryTagValue("javaReturnType");
+			$ret_type = translateJavaType($javaOut->getSysimportCtx(), $model, $method->getReturnTypeWithTagger()) unless (defined $ret_type);
+			$methodCtx->print(tabalign("public $ret_type", 32)."$method->{name}(".generateOperParamList($method).")\n$code\n");
+		}
+	}
+
+	$codeCtx->print("}\n");
+
+	$javaOut->printSysimport("import net.dryuf.meta.ActionDefs;\n");
+	$clsCtx->print("\@ActionDefs(actions = {\n");
+	if (@{$model->{action_list}}) {
+		$javaOut->printSysimport("import net.dryuf.meta.ActionDef;\n");
+		my $actions = "";
+		foreach my $action (@{$model->{action_list}}) {
+			eval {
+				my $atext = "name = \"".escapeString($action->{name})."\"";
+				$atext .= ", isStatic = ".net::dryuf::uml::prog::java::JavaGenerator::formatBoolean($action->isStatic())."";
+				if (defined (my $formActioner = $action->checkDryTagValue("formActioner"))) {
+					$atext .= ", formActioner = \"".escapeString($formActioner)."\"";
+				}
+				if (defined (my $formName = $action->checkDryTagValue("formName"))) {
+					$atext .= ", formName = \"".escapeString($formName)."\"";
+				}
+				if (defined (my $guiDef = $action->checkDryTagValue("guiDef"))) {
+					$atext .= ", guiDef = \"".escapeString($guiDef)."\"";
+				}
+				$atext .= ", roleAction = \"".escapeString($action->getDryTagValue("roleAction"))."\"";
+				$clsCtx->print("\t\@ActionDef($atext),\n");
+				1;
+			}
+				or net::dryuf::uml::Util::doDie("failed to process $model->{full}.$action->{name}:\n$@");
+		}
+	}
+	$clsCtx->replaceOptionalEnd(",\n", "\n");
+	$clsCtx->print("})\n");
+
+	if ($relations ne "") {
+		$javaOut->printSysimport("import net.dryuf.meta.RelationDef;\n");
+		$javaOut->printSysimport("import net.dryuf.meta.RelationDefs;\n");
+		$clsCtx->print("\@RelationDefs(relations = {\n");
+		$clsCtx->print($relations);
+		$clsCtx->replaceOptionalEnd(",\n", "\n");
+		$clsCtx->print("})\n");
+	}
+
+	$javaOut->printSysimport("import net.dryuf.meta.FilterDefs;\n");
+	$clsCtx->print("\@FilterDefs(filters = {\n");
+	if (%{$model->getDrySpecs("filter")}) {
+		foreach my $filter (sort({ $a->{order} <=> $b->{order} } values %{$model->getDrySpecs("filter")})) {
+			eval {
+				$javaOut->printSysimport("import net.dryuf.meta.FilterDef;\n");
+				$clsCtx->print("\t\@FilterDef(name = \"$filter->{spec}\", condition = \"$filter->{value}\"),\n");
+			}
+				or die "failed to process $model->{full}.$filter->{name}:\n$@";
+		}
+	}
+	$clsCtx->replaceOptionalEnd(",\n", "\n");
+	$clsCtx->print("})\n");
+
+	{
+		$javaOut->printSysimport("import net.dryuf.meta.PKeyDef;\n");
+		$clsCtx->print("\@PKeyDef(pkEmbedded = ".net::dryuf::uml::prog::java::JavaGenerator::formatBoolean($usePk).", pkClazz = ".(defined $pkClazz ? "$pkClazz.class" : "void.class").", pkField = \"$pkField\", composClazz = ".($composClazz ? "$composClazz" : "void").".class, composPkClazz = ".($composPkClazz ? "$composPkClazz" : "void").".class, composPath = \"".($usePk ? "pk." : "").($composField ? $composField : "")."\", additionalPkFields = { ".net::dryuf::uml::Util::removeOptionalEnd($addPkFields, ", ")." })\n");
+	}
+
+	if ($fieldOrder) {
+		$javaOut->printSysimport("import net.dryuf.meta.FieldOrder;\n");
+		$clsCtx->print("\@FieldOrder(fields = { ".substr($fieldOrder, 2)." })\n");
+	}
+	else {
+		$javaOut->printSysimport("import net.dryuf.meta.FieldOrder;\n");
+		$clsCtx->print("\@FieldOrder(fields = { "." })\n");
+	}
+}
+
+sub generateEntityBean($$$$)
+{
+	my $context			= shift;
+	my $location			= shift;
+	my $classname			= shift;
+	my $more			= shift;
+
+	my $jclassname = $classname; $jclassname =~ s/::/./g;
+	my $filename = $jclassname; $filename =~ s/\./\//g;
+	my $pkgname = $jclassname; $pkgname =~ s/\.\w+$//;
+	my $classonly = $jclassname; $classonly =~ s/^.*\.//g;
+
+	return if ($context->{processed}->{$filename});
+
+	my $model = $context->{model_store}->loadModel($location, $classname);
+
+	my $fdbean = $context->{file_trans}->updateChanged($context->{dst_dir}."/java/$filename.java");
+	my $writer = $fdbean->rememberContext();
+	$context->{processed}->{$filename} = 1;
+
+	$writer->print("package $pkgname;\n");
+	$writer->print("\n");
+	my $sysimportCtx = $writer->subContext();
+	$writer->print("\n");
+	my $appimportCtx = $writer->subContext();
+
+	$writer->print("\n\n");
+
+	my $javaOut = net::dryuf::uml::prog::java::JavaOutFileContext->new($context->{model_store}, $sysimportCtx, $appimportCtx, $writer);
+	generateEntityBeanPart($context, $javaOut, $model);
+
+	$context->{file_trans}->closeFile($fdbean);
+}
+
+sub generateOperParamList($)
+{
+	my $oper			= shift;
+
+	return join(", ",
+		map({
+				my ( $ptype, $ptagger ) = $_->getFinalTypeWithTagger();
+				($ptype->{stype} eq "primitive" ? net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($ptype) : convertToJavaClass($ptype->{full}))." $_->{name}"
+			} @{$oper->{param_list}})
+	);
+}
+
+sub translateUpdateRet($)
+{
+	my $oper = shift;
+
+	my $retType = net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($oper->getReturnTypeWithTagger());
+	my $proc;
+	if ($retType eq "Boolean") {
+		$retType = "boolean";
+		$proc = " != 0";
+	}
+	elsif ($retType eq "Integer") {
+		$retType = "int";
+		$proc = "";
+	}
+	elsif ($retType eq "Long") {
+		$retType = "long";
+		$proc = "";
+	}
+
+	return ( $retType, $proc );
+}
+
+sub generateEntityDaoIf($$$$)
+{
+	my $context			= shift;
+	my $location			= shift;
+	my $classname			= shift;
+	my $more			= shift;
+
+	my $jbaseclassname = $classname; $jbaseclassname =~ s/::/./g;
+	my $jclassname = $jbaseclassname."Dao";
+	my $pkgname = $jclassname; $pkgname =~ s/\.\w+$//;
+	my $classonly = $jclassname; $classonly =~ s/^.*\.//g;
+	my $baseclassonly = $jbaseclassname; $baseclassonly =~ s/^.*\.//g;
+	my $filename = "$pkgname.dao.${baseclassonly}Dao"; $filename =~ s/\./\//g;
+
+	return if ($context->{processed}->{$filename});
+
+	my $model = $context->{model_store}->loadModel($location, $classname);
+	my $dao = $model->checkSubModel("${classname}::Dao");
+
+	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/java/$filename.java");
+	$context->{processed}->{$filename} = 1;
+
+	$fddao->print("package $pkgname.dao;\n\n");
+	my $sysimportCtx = $fddao->rememberContext();
+	my $importCtx = $fddao->rememberContext();
+	$importCtx->printOnce("import $jbaseclassname;\n");
+
+	$fddao->printIndented("\n\npublic interface $classonly extends net.dryuf.dao.DynamicDao<$baseclassonly, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model).">\n{\n");
+	$fddao->indent(1);
+	my $methodCtx = $fddao->rememberContext();
+
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."refresh($baseclassonly obj);\n");
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."loadByPk(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk);\n");
+	$methodCtx->print(tabalign("public List<$baseclassonly>", 32)."listAll();\n");
+	$methodCtx->print(tabalign("public void", 32)."insert($baseclassonly obj);\n");
+	$methodCtx->print(tabalign("public void", 32)."insertTxNew($baseclassonly obj);\n");
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."update($baseclassonly obj);\n");
+	$methodCtx->print(tabalign("public void", 32)."remove($baseclassonly obj);\n");
+	$methodCtx->print(tabalign("public boolean", 32)."removeByPk(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk);\n");
+	if (defined (my $compos = $model->checkCompos())) {
+		$methodCtx->print(tabalign("public List<$baseclassonly>", 32)."listByCompos(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($compos->getAssocTarget())." compos);\n");
+		$methodCtx->print(tabalign("public long", 32)."removeByCompos(".(net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($compos->getAssocTarget()))." compos);\n");
+	}
+	$methodCtx->print("\n");
+
+	$sysimportCtx->printOnce("import java.util.Map;\n");
+	$sysimportCtx->printOnce("import java.util.List;\n");
+	$importCtx->printOnce("import net.dryuf.core.EntityHolder;\n");
+	$importCtx->printOnce("import net.dryuf.core.CallerContext;\n");
+	$importCtx->printOnce("import net.dryuf.transaction.TransactionHandler;\n");
+
+	$methodCtx->print(tabalign("public ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model), 32)."importDynamicKey(Map<String, Object> data);\n");
+	$methodCtx->print(tabalign("public Map<String, Object>", 32)."exportDynamicData(EntityHolder<$baseclassonly> holder);\n");
+	$methodCtx->print(tabalign("public Map<String, Object>", 32)."exportEntityData(EntityHolder<$baseclassonly> holder);\n");
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."createDynamic(EntityHolder<?> composition, Map<String, Object> data);\n");
+	$methodCtx->print(tabalign("public EntityHolder<$baseclassonly>", 32)."retrieveDynamic(EntityHolder<?> composition, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk);\n");
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."updateDynamic(EntityHolder<$baseclassonly> roleObject, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk, Map<String, Object> updates);\n");
+	$methodCtx->print(tabalign("public boolean", 32)."deleteDynamic(EntityHolder<?> composition, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk);\n");
+	$methodCtx->print(tabalign("public long", 32)."listDynamic(List<EntityHolder<$baseclassonly>> results, EntityHolder<?> composition, Map<String, Object> filter, List<String> sorts, Long start, Long limit);\n");
+	$methodCtx->print(tabalign("public TransactionHandler", 32)."keepContextTransaction(CallerContext callerContext);\n");
+	$methodCtx->print(tabalign("public <R> R", 32)."runTransactioned(java.util.concurrent.Callable<R> code) throws Exception;\n");
+	$methodCtx->print(tabalign("public <R> R", 32)."runTransactionedNew(java.util.concurrent.Callable<R> code) throws Exception;\n");
+	$methodCtx->print("\n");
+
+	#$methodCtx->print("public Collection<EntityHolder<$baseclassonly>> listAll();\n\n");
+	if ($dao) {
+		for my $oper (grep({ $_->{name} =~ /^dry\.(\w+)\./ } @{$dao->getOperations()})) {
+			net::dryuf::uml::Util::doDie("wrong name for dao operation: $oper->{name}") unless ($oper->{name} =~ m/^dry\.(\w+)\.(\w+)$/);
+			my $optype = $1;
+			my $opname = $2;
+			if ($optype eq "code") {
+				my $ret_type = translateJavaType($sysimportCtx, $model, $oper->getReturnTypeWithTagger());
+				$methodCtx->print(tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).");\n\n");
+			}
+			elsif ($optype eq "load") {
+				$methodCtx->print(tabalign("public $baseclassonly", 32)."$opname(".generateOperParamList($oper).");\n\n");
+			}
+			elsif ($optype eq "list") {
+				my $ret_type = translateJavaType($sysimportCtx, $model, $oper->getReturnTypeWithTagger());
+				$methodCtx->print(tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).");\n\n");
+			}
+			elsif ($optype eq "update") {
+				my ( $retType, $proc ) = translateUpdateRet($oper);
+				$methodCtx->print(tabalign("public $retType", 32)."$opname(".generateOperParamList($oper).");\n\n");
+			}
+			elsif ($optype eq "query") {
+				$methodCtx->print(tabalign("public ".net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($oper->getReturnTypeWithTagger()), 32)."$opname(".generateOperParamList($oper).");\n\n");
+			}
+			else {
+				net::dryuf::uml::Util::doDie("$jbaseclassname.$oper->{name}: unknown dao operation type: $optype");
+			}
+		}
+	}
+
+	$fddao->indent(-1);
+	$fddao->print("}\n");
+
+	$context->{file_trans}->closeFile($fddao);
+}
+
+sub generateEntityDaoHib($$$$)
+{
+	my $context			= shift;
+	my $location			= shift;
+	my $classname			= shift;
+	my $more			= shift;
+
+	my $jbaseclassname = $classname; $jbaseclassname =~ s/::/./g;
+	my $jclassname = $jbaseclassname."DaoHib";
+	my $filename = $jclassname; $filename =~ s/\./\//g;
+	my $pkgbase = $jclassname; $pkgbase =~ s/\.\w+$//;
+	my $pkgname = $jclassname; $pkgname =~ s/\.\w+$//; $pkgname .= ".hibdao";
+	my $classonly = $jclassname; $classonly =~ s/^.*\.//g;
+	my $baseclassonly = $jbaseclassname; $baseclassonly =~ s/^.*\.//g;
+
+	return if ($context->{processed}->{$filename});
+
+	my $model = $context->{model_store}->loadModel($location, $classname);
+	my $dao = $model->checkSubModel("${classname}::Dao");
+
+	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/java".net::dryuf::uml::Util::prependFile("/$filename.java", "hibdao/"));
+	$context->{processed}->{$filename} = 1;
+
+	$fddao->print("package $pkgname;\n\n");
+	my $sysimportCtx = $fddao->rememberContext();
+	$sysimportCtx->printOnce("import $jbaseclassname;\n");
+	$sysimportCtx->printOnce("import org.hibernate.SessionFactory;\n");
+	$sysimportCtx->printOnce("import org.springframework.orm.hibernate3.HibernateTemplate;\n");
+	$sysimportCtx->printOnce("import org.springframework.stereotype.Repository;\n");
+	$sysimportCtx->printOnce("import org.springframework.transaction.annotation.Propagation;\n");
+	$sysimportCtx->printOnce("import org.springframework.transaction.annotation.Transactional;\n");
+
+	my $importCtx = $fddao->rememberContext();
+
+	$fddao->printIndented("\n\n\@Repository\n\@Transactional(readOnly = true)\npublic class $classonly extends net.dryuf.dao.ContextDao implements $pkgbase.dao.${baseclassonly}Dao\n{\n");
+	$fddao->indent(1);
+	my $fieldCtx = $fddao->rememberContext();
+	$fddao->printIndented("\n");
+	my $methodCtx = $fddao->rememberContext();
+
+	$fddao->printAt($fieldCtx, tabalign("protected HibernateTemplate", 32)."template = null;\n\n");
+
+	$fddao->printAt($methodCtx, tabalign("public void", 32)."setSessionFactory(SessionFactory sessionFactory)\n{\ttemplate = new HibernateTemplate(sessionFactory);\n}\n\n");
+
+	$methodCtx->print("\@Transactional(readOnly = true, propagation = Propagation.REQUIRED)\n".tabalign("public $baseclassonly", 32)."loadByPk(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk)\n{\n\tthrow new RuntimeException(\"unsupported\"); /*return template.bulkUpdate(\"FROM $baseclassonly WHERE ".net::dryuf::uml::prog::java::JavaGenerator::getPkFieldName($model)." = ?\", pk); */\n}\n\n");
+	$methodCtx->print("\@Transactional(readOnly = true, propagation = Propagation.REQUIRED)\n".tabalign("public $baseclassonly", 32)."listAll()\n{\n\tthrow new RuntimeException(\"unsupported\"); /*return template.bulkUpdate(\"FROM $baseclassonly WHERE ".net::dryuf::uml::prog::java::JavaGenerator::getPkFieldName($model)." = ?\", pk); */\n}\n\n");
+	$methodCtx->print("\@Transactional(readOnly = false, propagation = Propagation.REQUIRED)\n".tabalign("public void", 32)."insert($baseclassonly obj)\n{\n\ttemplate.saveOrUpdate(obj);\n}\n\n");
+	$methodCtx->print("\@Transactional(readOnly = false, propagation = Propagation.REQUIRES_NEW)\n".tabalign("public void", 32)."insertTxNew($baseclassonly obj)\n{\n\ttemplate.saveOrUpdate(obj);\n}\n\n");
+	$methodCtx->print("\@Transactional(readOnly = false, propagation = Propagation.REQUIRED)\n".tabalign("public $baseclassonly", 32)."update($baseclassonly obj)\n{\n\ttemplate.saveOrUpdate(obj);\n}\n\n");
+	$methodCtx->print("\@Transactional(readOnly = false, propagation = Propagation.REQUIRED)\n".tabalign("public void", 32)."remove($baseclassonly obj)\n{\n\ttemplate.delete(obj);\n}\n\n");
+	$methodCtx->print("\@Transactional(readOnly = false, propagation = Propagation.REQUIRED)\n".tabalign("public boolean", 32)."removeByPk(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk)\n{\n\treturn template.bulkUpdate(\"DELETE FROM $baseclassonly WHERE ".net::dryuf::uml::prog::java::JavaGenerator::getPkFieldName($model)." = ?\", pk) != 0;\n}\n\n");
+
+	$sysimportCtx->printOnce("import java.util.Map;\n");
+	$sysimportCtx->printOnce("import java.util.List;\n");
+	$importCtx->printOnce("import net.dryuf.core.EntityHolder;\n");
+	$importCtx->printOnce("import net.dryuf.core.CallerContext;\n");
+
+	$methodCtx->print(tabalign("public ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model), 32)."importDynamicKey(Map<String, Object> data) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public Map<String, Object>", 32)."exportDynamicData(EntityHolder<$baseclassonly> holder) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public Map<String, Object>", 32)."exportEntityData(EntityHolder<$baseclassonly> holder) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."createDynamic(EntityHolder<?> composition, Map<String, Object> data) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public EntityHolder<$baseclassonly>", 32)."retrieveDynamic(EntityHolder<?> composition, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public $baseclassonly", 32)."updateDynamic(EntityHolder<$baseclassonly> roleObject, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk, Map<String, Object> updates) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public boolean", 32)."deleteDynamic(EntityHolder<?> composition, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print(tabalign("public long", 32)."listDynamic(List<EntityHolder<$baseclassonly>> results, EntityHolder<?> composition, Map<String, Object> filter, List<String> sorts, Long start, Long limit) { throw new UnsupportedOperationException(\"hibernate dao do not support dynamic operations\"); }\n");
+	$methodCtx->print("\n");
+
+	#$fddao->printAt($methodCtx, "\@SuppressWarnings(\"unchecked\")\n".tabalign("public Collection<EntityHolder<$baseclassonly>>", 32)."listAll()\n{\n\tCollection<EntityHolder<$baseclassonly>> result = new LinkedList<EntityHolder<$baseclassonly>>();\n\tfor ($baseclassonly obj: (Collection<$baseclassonly>)template.find(\"from $baseclassonly\")) {\n\t\tresult.add(new EntityHolder<$baseclassonly>(obj, role));\n\t}\n\treturn result;\n}\n\n");
+	if ($dao) {
+		for my $oper (grep({ $_->{name} =~ /^dry\.(\w+)\./ } @{$dao->{oper_list}})) {
+			net::dryuf::uml::Util::doDie("wrong name for dao operation: $oper->{name}") unless ($oper->{name} =~ m/^dry\.(\w+)\.(\w+)$/);
+			my $optype = $1;
+			my $opname = $2;
+			if ($optype eq "load") {
+				if (0) {
+					$sysimportCtx->printOnce("import net.dryuf.core.EntityHolder;\n");
+					$sysimportCtx->printOnce("import java.util.List;\n");
+					$methodCtx->print(tabalign("\@SuppressWarnings(\"unchecked\")\npublic EntityHolder<$baseclassonly>", 32)." $opname(".generateOperParamList($oper).")\n{\n");
+					my $contCtx = $methodCtx->indentContext(1);
+					my $sql = "";
+					my $cond = "";
+					my $list = "";
+					if (defined ($sql = $oper->checkDryTagValue("jql"))) {
+						while ($sql =~ m/^(.*?):(\w+)(.*?)$/s) {
+							$sql = "$1?$3";
+							$list .= ", $2";
+						}
+					}
+					else {
+						foreach my $param (@{$oper->{param_list}}) {
+							$cond .= " AND $param->{name} = ?";
+							$list .= ", $param->{name}";
+						}
+						$cond = substr($cond, 5);
+						$sql = "FROM $baseclassonly WHERE $cond";
+					}
+					$contCtx->print("List<$baseclassonly> result = template.find(\"".escapeString($sql)."\"$list);\n");
+					$contCtx->print("if (result.isEmpty())\n\treturn null;\n");
+					$contCtx->print("return new EntityHolder<$baseclassonly>(result.get(0), null);\n");
+					$methodCtx->print("}\n\n");
+				}
+				else {
+					$sysimportCtx->printOnce("import java.util.List;\n");
+					$methodCtx->print(tabalign("public $baseclassonly", 32)." $opname(".generateOperParamList($oper).")\n{\n");
+					my $contCtx = $methodCtx->indentContext(1);
+					my $sql = "";
+					my $cond = "";
+					my $list = "";
+					if (defined ($sql = $oper->checkDryTagValue("jql"))) {
+						while ($sql =~ m/^(.*?):(\w+)(.*?)$/s) {
+							$sql = "$1?$3";
+							$list .= ", $2";
+						}
+					}
+					else {
+						foreach my $param (@{$oper->{param_list}}) {
+							$cond .= " AND $param->{name} = ?";
+							$list .= ", $param->{name}";
+						}
+						$cond = substr($cond, 5);
+						$sql = "FROM $baseclassonly WHERE $cond";
+					}
+					$contCtx->print("\@SuppressWarnings(\"unchecked\")\nList<$baseclassonly> result = template.find(\"".escapeString($sql)."\"$list);\n");
+					$contCtx->print("if (result.isEmpty())\n\treturn null;\n");
+					$contCtx->print("return result.get(0);\n");
+					$methodCtx->print("}\n\n");
+				}
+			}
+			elsif ($optype eq "list") {
+				my $ret_type = translateJavaType($sysimportCtx, $model, $oper->getReturnTypeWithTagger());
+				$methodCtx->print(tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my $sql = $oper->getDryTagValue("jql");
+				my $cond = "";
+				my $list = "";
+				while ($sql =~ m/^(.*?):(\w+)(.*?)$/s) {
+					$sql = "$1?$3";
+					$list .= ", $2";
+				}
+				$methodCtx->print("\t\@SuppressWarnings(\"unchecked\")\n\t$ret_type result = ($ret_type)template.find(\"".escapeString($sql)."\"$list);\n");
+				$methodCtx->print("\treturn result;\n");
+				$methodCtx->print("}\n\n");
+			}
+			elsif ($optype eq "update") {
+				my $retType = net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($oper->getReturnTypeWithTagger());
+				$methodCtx->print(tabalign("public $retType", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my $sql = $oper->getDryTagValue("jql");
+				my $cond = "";
+				my $list = "";
+				while ($sql =~ m/^(.*?):((\w+\.)*\w+(\(\))?)(.*?)$/s) {
+					$sql = "$1?$5";
+					$list .= ", $2";
+				}
+				$methodCtx->print("\ttemplate.bulkUpdate(\"".escapeString($sql)."\"$list);\n");
+				$methodCtx->print("}\n\n");
+			}
+			elsif ($optype eq "query") {
+				my $ret_type = net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($oper->getReturnTypeWithTagger());
+				$methodCtx->print(tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my $sql = $oper->getDryTagValue("jql");
+				my $cond = "";
+				my $list = "";
+				while ($sql =~ m/^(.*?):(\w+(\(\))?)(.*?)$/s) {
+					$sql = "$1?$4";
+					$list .= ", $2";
+				}
+				$sysimportCtx->printOnce("import java.util.List;\n");
+				$methodCtx->print("\t\@SuppressWarnings(\"rawtypes\")\n\tList result = template.find(\"".escapeString($sql)."\"$list);\n");
+				$methodCtx->print("\treturn result.isEmpty() ? null : ($ret_type)result.get(0);\n");
+				$methodCtx->print("}\n\n");
+			}
+			else {
+				net::dryuf::uml::Util::doDie("$jbaseclassname.$oper->{name}: unknown dao operation type: $optype");
+			}
+		}
+	}
+
+	$fddao->indent(-1);
+	$fddao->print("}\n");
+
+	$context->{file_trans}->closeFile($fddao);
+}
+
+sub getEjbTransactionParams($$$)
+{
+	my $oper			= shift;
+	my $readOnly_dfl		= shift;
+	my $propagation_dfl		= shift;
+
+	my $readOnly = $oper->checkDryTagValue("readOnly") // $readOnly_dfl;
+	my $propagation = $oper->checkDryTagValue("propagation") // $propagation_dfl;
+	my $args = "";
+	#$args .= ", readOnly = ".(convertBool($readOnly) ? "true" : "false") if ($readOnly ne "");
+	#$args .= ", propagation = Propagation.$propagation" if ($propagation);
+	$args .= ", TransactionAttributeType.$propagation" if ($propagation);
+	my $transactionUnit = "\@Transactional(\"".getDataSource($oper->{owner})."\")\n";
+	return ($args ? "\@TransactionAttribute(".substr($args, 2).")\n" : "").
+		$transactionUnit;
+}
+
+sub replaceJqlParams($)
+{
+	my $oper			= shift;
+
+	my $sql = $oper->getDryTagValue("jql");
+	my $list = "";
+	my $i = 0;
+	while ($sql =~ m/^(.*?):((\w+)(\.(\w+)(\(\))?)*)(.*?)$/s) {
+		++$i;
+		$sql = "$1?$i$7";
+		$list .= ".setParameter($i, $2)";
+	}
+	return ( $sql, $list );
+}
+
+sub generateEntityDaoJpa($$$$)
+{
+	my $context			= shift;
+	my $location			= shift;
+	my $classname			= shift;
+	my $more			= shift;
+
+	my $jbaseclassname = $classname; $jbaseclassname =~ s/::/./g;
+	my $jclassname = $jbaseclassname."DaoJpa";
+	my $filename = $jclassname; $filename =~ s/\./\//g;
+	my $pkgbase = $jclassname; $pkgbase =~ s/\.\w+$//;
+	my $pkgname = $jclassname; $pkgname =~ s/\.\w+$//; $pkgname .= ".jpadao";
+	my $classonly = $jclassname; $classonly =~ s/^.*\.//g;
+	my $baseclassonly = $jbaseclassname; $baseclassonly =~ s/^.*\.//g;
+
+	return if ($context->{processed}->{$filename});
+
+	my $model = $context->{model_store}->loadModel($location, $classname);
+	my $dao = $model->checkSubModel("${classname}::Dao");
+
+	my $pkclassname = net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model);
+
+	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/java".net::dryuf::uml::Util::prependFile("/$filename.java", "jpadao/"));
+	$context->{processed}->{$filename} = 1;
+
+	$fddao->print("package $pkgname;\n\n");
+	my $sysimportCtx = $fddao->rememberContext();
+	$sysimportCtx->printOnce("import $jbaseclassname;\n");
+	#$sysimportCtx->printOnce("import javax.persistence.EntityManager;\n");
+	#$sysimportCtx->printOnce("import javax.persistence.PersistenceContext;\n");
+	#$sysimportCtx->printOnce("import javax.persistence.PersistenceUnit;\n");
+	$sysimportCtx->printOnce("import javax.ejb.TransactionAttribute;\n");
+	$sysimportCtx->printOnce("import javax.ejb.TransactionAttributeType;\n");
+	$sysimportCtx->printOnce("import org.springframework.stereotype.Repository;\n");
+	#$sysimportCtx->printOnce("import org.springframework.transaction.annotation.Propagation;\n");
+	$sysimportCtx->printOnce("import org.springframework.transaction.annotation.Transactional;\n");
+
+	my $importCtx = $fddao->rememberContext();
+
+	my $transactionUnit = "\@Transactional(\"".getDataSource($dao || $model)."\")\n";
+	my $daoContextBase = getDaoContextBase($dao || $model);
+
+	$fddao->printIndented("\n\n\@Repository\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.SUPPORTS)\npublic class $classonly extends $daoContextBase<$baseclassonly, $pkclassname> implements $pkgbase.dao.${baseclassonly}Dao\n{\n");
+	$fddao->indent(1);
+	my $fieldCtx = $fddao->rememberContext();
+	$fddao->printIndented("\n");
+	my $methodCtx = $fddao->rememberContext();
+
+	$methodCtx->print(tabalign("public", 32).$classonly."()\n{\n\tsuper($baseclassonly.class);\n}\n\n");
+
+	#$fddao->printAt($fieldCtx, "\@PersistenceContext(unitName = \"".getDataSource($dao || $model)."\")\n");
+	#$fddao->printAt($fieldCtx, "\@PersistenceUnit(name = \"".getDataSource($dao || $model)."\")\n");
+	#$fddao->printAt($fieldCtx, tabalign("protected EntityManager", 32)."em;\n\n");
+	#$fddao->printAt($fieldCtx, "\@PersistenceContext(name = \"".getDataSource($dao || $model)."\")\n");
+	#$fddao->printAt($fieldCtx, tabalign("public void", 32)."setEntityManager(EntityManager entityManager)\n{\n\tsuper.setEntityManagerInternal(entityManager);\n}\n\n");
+
+	#$importCtx->printOnce("import net.dryuf.dao.RoleDaoAccessJpa;\n");
+	#$fieldCtx->print(tabalign("protected RoleDaoAccessJpa<$baseclassonly>", 32)."roleDaoAccess;\n\n");
+	#$methodCtx->print(tabalign("public RoleDaoAccessJpa<$baseclassonly>", 32)."getRoleDaoAccess()\n{\n\tif (roleDaoAccess == null)\n\t\troleDaoAccess = new RoleDaoAccessJpa<$baseclassonly>($baseclassonly.class, em);\n\treturn roleDaoAccess;\n}\n\n");
+
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.SUPPORTS)\n".tabalign("public $baseclassonly", 32)."loadByPk(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk)\n{\n\treturn ($baseclassonly)em.find($baseclassonly.class, pk);\n}\n\n");
+	#$methodCtx->print("\@SuppressWarnings(\"unchecked\")\n\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.SUPPORTS)\n".tabalign("public List<$baseclassonly>", 32)."listAll()\n{\n\treturn (List<$baseclassonly>)em.createQuery(\"SELECT ent FROM $baseclassonly ent ORDER BY ".net::dryuf::uml::prog::java::JavaGenerator::getPkFieldName($model)."\").getResultList();\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public void", 32)."insert($baseclassonly obj)\n{\n\tem.persist(obj);\n\tem.flush();\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRES_NEW)\n".tabalign("public void", 32)."insertTxNew($baseclassonly obj)\n{\n\tem.persist(obj);\n\tem.flush();\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public $baseclassonly", 32)."update($baseclassonly obj)\n{\n\tobj = em.merge(obj);\n\tem.flush();\n\treturn obj;\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public void", 32)."remove($baseclassonly obj)\n{\n\tem.remove(obj);\n\tem.flush();\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public boolean", 32)."removeByPk(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk)\n{\n\treturn em.createQuery(\"DELETE FROM $baseclassonly obj WHERE obj.".net::dryuf::uml::prog::java::JavaGenerator::getPkFieldName($model)." = ?1\").setParameter(1, pk).executeUpdate() != 0;\n}\n\n");
+	if (defined (my $compos = $model->checkCompos())) {
+		#$sysimportCtx->printOnce("import java.util.Map;\n");
+		$sysimportCtx->printOnce("import java.util.List;\n");
+		$methodCtx->print("\@SuppressWarnings(\"unchecked\")\n\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public List<$baseclassonly>", 32)."listByCompos(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($compos->getAssocTarget())." compos)\n{\n\treturn (List<$baseclassonly>)entityManager.createQuery(\"FROM $baseclassonly WHERE ".(hasComplexPrimary($model) ? "pk." : "").$compos->{name}." = ?1 ORDER BY ".net::dryuf::uml::prog::java::JavaGenerator::getPkFieldName($model)."\").setParameter(1, compos).getResultList();\n}\n\n");
+		$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public long", 32)."removeByCompos(".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($compos->getAssocTarget())." compos)\n{\n\treturn entityManager.createQuery(\"DELETE FROM $baseclassonly obj WHERE obj.pk.".$compos->{name}." = ?1\").setParameter(1, compos).executeUpdate();\n}\n\n");
+	}
+
+	#$importCtx->printOnce("import net.dryuf.core.EntityHolder;\n");
+	#$importCtx->printOnce("import net.dryuf.core.CallerContext;\n");
+
+	#$methodCtx->print(tabalign("public ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model), 32)."openRelation(EntityHolder<$baseclassonly> holder, String relation)\n{\n\tthrow new UnsupportedOperationException(\"openRelation not supported yet\");\n}\n\n");
+	#$methodCtx->print(tabalign("public ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model), 32)."importDynamicKey(Map<String, Object> data)\n{\n\treturn (".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model).")getRoleDaoAccess().importDynamicKey(data);\n}\n\n");
+	#$methodCtx->print(tabalign("public Map<String, Object>", 32)."exportDynamicData(EntityHolder<$baseclassonly> holder)\n{\n\treturn getRoleDaoAccess().exportDynamicData(holder);\n}\n\n");
+	#$methodCtx->print(tabalign("public Map<String, Object>", 32)."exportEntityData(EntityHolder<$baseclassonly> holder)\n{\n\treturn getRoleDaoAccess().exportEntityData(holder);\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public $baseclassonly", 32)."createDynamic(EntityHolder<?> composition, Map<String, Object> data)\n{\n\treturn getRoleDaoAccess().createObject(composition, data);\n}\n\n");
+	#$methodCtx->print(tabalign("public EntityHolder<$baseclassonly>", 32)."retrieveDynamic(EntityHolder<?> composition, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk)\n{\n\treturn getRoleDaoAccess().retrieveObject(baseContext, pk);\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public $baseclassonly", 32)."updateDynamic(EntityHolder<$baseclassonly> roleObject, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk, Map<String, Object> updates)\n{\n\treturn getRoleDaoAccess().updateObject(roleObject, pk, updates);\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public boolean", 32)."deleteDynamic(CallerContext roleContext, ".net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model)." pk)\n{\n\treturn getRoleDaoAccess().deleteObject(roleContext, pk);\n}\n\n");
+	#$methodCtx->print(tabalign("public long", 32)."listDynamic(List<EntityHolder<$baseclassonly>> results, EntityHolder<?> composition, Map<String, Object> filter, List<String> sorts, Long start, Long limit)\n{\n\treturn getRoleDaoAccess().listObjects(results, composition, filter, sorts, start, limit);\n}\n\n");
+	#$methodCtx->print("\@Override\n$transactionUnit\@TransactionAttribute(TransactionAttributeType.REQUIRED)\n".tabalign("public <R> R", 32)."runTransactioned(java.util.concurrent.Callable<R> code) throws Exception\n{\n\treturn code.call();\n}\n\n");
+
+	#$methodCtx->print("\n");
+
+	if ($dao) {
+		for my $oper (grep({ $_->{name} =~ /^dry\.(\w+)\./ } @{$dao->{oper_list}})) {
+			net::dryuf::uml::Util::doDie("wrong name for dao operation: $oper->{name}") unless ($oper->{name} =~ m/^dry\.(\w+)\.(\w+)$/);
+			my $optype = $1;
+			my $opname = $2;
+			if ($optype eq "code") {
+				my $ret_type = translateJavaType($sysimportCtx, $model, $oper->getReturnTypeWithTagger());
+				$methodCtx->print("\@Override\n".getEjbTransactionParams($oper, 0, "SUPPORTS").tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				$methodCtx->print(indentString(makeLineEnd($oper->getDryTagValue("code")), "\t"));
+				$methodCtx->print("}\n\n");
+			}
+			elsif ($optype eq "load") {
+				$sysimportCtx->printOnce("import java.util.List;\n");
+				$methodCtx->print("\@Override\n".getEjbTransactionParams($oper, 0, "SUPPORTS").tabalign("public $baseclassonly", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my $contCtx = $methodCtx->indentContext(1);
+				my $sql = "";
+				my $list = "";
+				if (defined ($sql = $oper->checkDryTagValue("jql"))) {
+					$sql = replaceJqlParams($oper);
+					( $sql, $list ) = replaceJqlParams($oper);
+				}
+				else {
+					my $cond = "";
+					my $i = 0;
+					foreach my $param (@{$oper->{param_list}}) {
+						++$i;
+						$cond .= " AND $param->{name} = ?$i";
+						$list .= ".setParameter($i, $param->{name})";
+					}
+					$cond = substr($cond, 5);
+					$sql = "FROM $baseclassonly WHERE $cond";
+				}
+				$contCtx->print("\@SuppressWarnings(\"unchecked\")\nList<$baseclassonly> result = entityManager.createQuery(\"".escapeString($sql)."\")$list.getResultList();\n");
+				$contCtx->print("if (result.isEmpty())\n\treturn null;\n");
+				$contCtx->print("return result.get(0);\n");
+				$methodCtx->print("}\n\n");
+			}
+			elsif ($optype eq "list") {
+				my $ret_type = translateJavaType($sysimportCtx, $model, $oper->getReturnTypeWithTagger());
+				$methodCtx->print("\@Override\n".getEjbTransactionParams($oper, 0, "SUPPORTS").tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my ( $sql, $list ) = replaceJqlParams($oper);
+				$methodCtx->print("\t\@SuppressWarnings(\"unchecked\")\n\t$ret_type result = ($ret_type)entityManager.createQuery(\"".escapeString($sql)."\")$list.getResultList();\n");
+				$methodCtx->print("\treturn result;\n");
+				$methodCtx->print("}\n\n");
+			}
+			elsif ($optype eq "update") {
+				my ( $retType, $proc ) = translateUpdateRet($oper);
+				$methodCtx->print("\@Override\n".getEjbTransactionParams($oper, 0, "REQUIRED").tabalign("public $retType", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my ( $sql, $list ) = replaceJqlParams($oper);
+				$methodCtx->print("\t".(defined $proc ? "return " : "")."entityManager.createQuery(\"".escapeString($sql)."\")$list.executeUpdate()".(defined $proc ? $proc : "").";\n");
+				$methodCtx->print("}\n\n");
+			}
+			elsif ($optype eq "query") {
+				my $ret_type = net::dryuf::uml::prog::java::JavaGenerator::mapJavaType($oper->getReturnTypeWithTagger());
+				$methodCtx->print("\@Override\n".getEjbTransactionParams($oper, 0, "SUPPORTS").tabalign("public $ret_type", 32)."$opname(".generateOperParamList($oper).")\n{\n");
+				my ( $sql, $list ) = replaceJqlParams($oper);
+				$sysimportCtx->printOnce("import java.util.List;\n");
+				$methodCtx->print("\t\@SuppressWarnings(\"rawtypes\")\n\tList result = entityManager.createQuery(\"".escapeString($sql)."\")$list.getResultList();\n");
+				$methodCtx->print("\treturn result.isEmpty() ? null : ($ret_type)result.get(0);\n");
+				$methodCtx->print("}\n\n");
+			}
+			else {
+				net::dryuf::uml::Util::doDie("$jbaseclassname.$oper->{name}: unknown dao operation type: $optype");
+			}
+		}
+	}
+
+	$fddao->indent(-1);
+	$fddao->print("}\n");
+
+	$context->{file_trans}->closeFile($fddao);
+}
+
+sub generateFile($$$$)
+{
+	my $context			= shift;
+	my $location			= shift;
+	my $classname			= shift;
+	my $gens			= shift;
+
+	if (!eval {
+			foreach my $gen (@$gens) {
+				$gen =~ m/^(\w+)(:(.*))?$/
+					or net::dryuf::uml::Util::doDie("failed to match gen element to word(:options)?: $gen");
+				$gen = $1; my $more = $2;
+				if ($gen eq "entbean") {
+					generateEntityBean($context, $location, $classname, $more);
+				}
+				elsif ($gen eq "daoif") {
+					generateEntityDaoIf($context, $location, $classname, $more);
+				}
+				elsif ($gen eq "daojpa") {
+					generateEntityDaoJpa($context, $location, $classname, $more);
+				}
+				elsif ($gen eq "daohib") {
+					generateEntityDaoHib($context, $location, $classname, $more);
+				}
+				else {
+					net::dryuf::uml::Util::doDie("unknown gen identifier '$gen' for $classname");
+				}
+			}
+		1;
+		}) {
+		net::dryuf::uml::Util::doDie("failed to generate $location/$classname: $@");
+	}
+}
+
+sub runFile($$$$)
+{
+	my $model_store		= shift;
+	my $src_dir		= shift;
+	my $dst_dir		= shift;
+	my $relname		= shift;
+
+	my $err = eval {
+		my $processor;
+		if ($relname =~ m/\.java$/) {
+			$processor = net::dryuf::uml::prog::java::JavaGenerator->new($file_trans, $model_store, $dst_dir, $src_dir, $relname);
+		}
+		else {
+			$processor = net::dryuf::uml::prog::gen::CopyGenerator->new($file_trans, $model_store, $dst_dir, $src_dir, $relname);
+		}
+		$processor->process()
+			or $file_trans->flush(), 0;
+	};
+	unless (defined $err) {
+		STDERR->print("$src_dir/$relname:0: fatal error occurred: $@");
+		return 1;
+	}
+	return $err;
+}
+
+sub runDirectories($$)
+{
+	my $src_dir		= shift;
+	my $dst_dir		= shift;
+
+	$dst_dir .= "/" unless ($dst_dir =~ m,/$,);
+	my @files;
+
+	my $model_store = net::dryuf::uml::ModelStore->new($opts{m});
+
+	my $context = {
+		file_trans		=> $file_trans,
+		dst_dir			=> $dst_dir,
+		processed		=> {},
+		model_store		=> $model_store,
+	};
+
+	if (defined $src_dir) {
+		$src_dir .= "/" unless ($src_dir =~ m,/$,);
+		find({
+				no_chdir		=> 1,
+				wanted			=> sub {
+					if (m/^(\.\/)?(.*\/|)(.*)\.(java|xml|properties|sql)$/) {
+						push(@files, $_);
+					}
+				},
+				preprocess		=> sub {
+					return unless ($File::Find::dir eq $src_dir || $File::Find::dir."/" eq $src_dir || $File::Find::dir =~ m,^(.*/)(\w+)$,);
+					return @_;
+				},
+			}, $src_dir);
+
+		foreach my $fullname (@files) {
+			die "wrong name: $fullname" unless (substr($fullname, 0, length($src_dir)) eq $src_dir);
+			my $relname = substr($fullname, length($src_dir));
+			my $src_mtime = (stat("$src_dir$relname"))[9];
+			my $dst_mtime = (stat("$dst_dir$relname"))[9];
+			next if (defined $dst_mtime && $src_mtime <= $dst_mtime);
+			$dst_mtime = "-" unless (defined $dst_mtime);
+			STDERR->print("generate from $src_dir$relname: $src_mtime $dst_mtime\n");
+			if ((my $err = runFile($model_store, $src_dir, $dst_dir, $relname)) != 0) {
+				return $err;
+			}
+		}
+	}
+
+	if (defined $opts{l}) {
+		my $fdlist = FileHandle->new("$opts{l}", "<")
+			or die "failed to open $opts{l}: $!";
+		while (<$fdlist>) {
+			chomp;
+			s/\s*(|#.*)$//;
+			next unless (length($_));
+			m/^(\S+)\s+(\S+)\s+(.*)$/
+				or die "gen line does not match 'location class gens': $_";
+			my $location = $1;
+			my $classname = $2;
+			my @gens = split(/\s+/, $3);
+			$classname =~ s/\./::/g;
+			generateFile($context, $location, $classname, \@gens);
+		}
+	}
+
+	return 0;
+}
+
+
+net::dryuf::uml::Util::installDryufEnv();
+
+getopts('gdm:l:', \%opts)
+	or exit(2);
+
+$file_trans = net::dryuf::uml::FileTransaction->new();
+my $err;
+
+if ($opts{g}) {
+	die "Usage (dir): $0 -g dst-dir" unless (@ARGV == 1);
+	$err = runDirectories(undef, $ARGV[0]);
+}
+elsif ($opts{d}) {
+	die "Usage (dir): $0 -d src-dir dst-dir" unless (@ARGV == 2);
+	$err = runDirectories($ARGV[0], $ARGV[1]);
+}
+else {
+	die "Usage (file): $0 src-dir dst-dir file" unless (@ARGV == 3);
+	$err = runFile(net::dryuf::uml::ModelStore->new($opts{m}), $ARGV[0], $ARGV[1], $ARGV[2]);
+}
+
+if ($err == 0) {
+	$file_trans->commit();
+}
+undef $file_trans;
+exit($err);

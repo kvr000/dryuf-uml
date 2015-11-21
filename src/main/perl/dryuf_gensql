@@ -1,0 +1,501 @@
+#!/usr/bin/perl
+
+#
+# Dryuf framework
+#
+# ----------------------------------------------------------------------------------
+#
+# Copyright (C) 2000-2015 Zbyněk Vyškovský
+#
+# ----------------------------------------------------------------------------------
+#
+# LICENSE:
+#
+# This file is part of Dryuf
+#
+# Dryuf is free software; you can redistribute it and/or modify it under the
+# terms of the GNU Lesser General Public License as published by the Free
+# Software Foundation; either version 3 of the License, or (at your option)
+# any later version.
+#
+# Dryuf is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+# more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Dryuf; if not, write to the Free Software Foundation, Inc., 51
+# Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# @author	2000-2015 Zbyněk Vyškovský
+# @link		mailto:kvr@matfyz.cz
+# @link		http://kvr.matfyz.cz/software/java/dryuf/
+# @link		http://github.com/dryuf/
+# @license	http://www.gnu.org/licenses/lgpl.txt GNU Lesser General Public License v3
+#
+
+package main;
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Data::Dumper;
+use Getopt::Std;
+use File::Basename;
+
+use lib dirname($0)."/perl";
+use net::dryuf::uml::FileTransaction;
+use net::dryuf::uml::SepOutput;
+use net::dryuf::uml::ModelStore;
+use net::dryuf::uml::GenmapReader;
+use net::dryuf::uml::Util qw(defvalue tabalign);
+
+package net::dryuf::uml::gensql::adaptor::Adaptor;
+
+use strict;
+use warnings;
+
+use net::dryuf::uml::Util qw(defvalue tabalign);
+
+our %SQL_UML_TYPES_PRIM = (
+	Boolean				=> "boolean",
+	Integer				=> "int",
+	Long				=> "bigint",
+	long				=> "bigint",
+	int				=> "int",
+	float				=> "float",
+	Integer				=> "int",
+	date				=> "date",
+	datetime			=> "datetime",
+	timestamp			=> "timestamp",
+);
+
+our %SQL_UML_TYPES_VAR = (
+	string				=> "varchar",
+	binary				=> "varbinary",
+);
+
+our %SQL_UML_TYPES_LOB = (
+	blob				=> "longblob",
+);
+
+sub new
+{
+	my $class = shift; $class = ref($class) || $class;
+	my $out				= shift;
+
+	die "out not specified" unless (defined $out);
+
+	my $this = bless {
+		out				=> $out,
+	}, $class;
+
+	return $this;
+}
+
+sub dieAttrContext($$)
+{
+	my $this			= shift;
+	my $field			= shift;
+	my $msg				= shift;
+
+	net::dryuf::uml::Util::doDie("$field->{owner}->{filename}:0: $field->{owner}->{full}.$field->{name}: $msg");
+}
+
+sub startCreateTable
+{
+	my $this			= shift;
+	my $model			= shift;
+
+	return "CREATE TABLE $model->{db_table} (\n";
+}
+
+sub endCreateTable
+{
+	my $this			= shift;
+	my $model			= shift;
+
+	return ");\n";
+}
+
+sub formatIndex
+{
+	my $this			= shift;
+	my $model			= shift;
+	my $index			= shift;
+
+	if (defined (my $type = $this->supportsIndex($index->{type}))) {
+		$this->{out}->print("CREATE ${type}INDEX $model->{name}_$index->{name} ON $model->{name} (\n");
+		my $sqlind = net::dryuf::uml::SepOutput->new($this->{out}, { sep_in => ", ", sep_all => "\n" });
+		$sqlind->printObj("\t".$_) foreach (@{$index->{fields}});
+		undef $sqlind;
+		$this->{out}->print(");\n");
+	}
+}
+
+sub retranslateSqlType
+{
+	my $this			= shift;
+	my $sqlType			= shift;
+	my $sqlBase			= shift;
+	my $umlType			= shift;
+	my $umlBase			= shift;
+	my $typeSize			= shift;
+
+	return $sqlType;
+}
+
+sub translateSqlType
+{
+	my $this			= shift;
+	my $field			= shift;
+
+	eval {
+		my ( $type, $tagger ) = $field->getFinalTypeWithTagger();
+
+		if (defined (my $db_type = defvalue($tagger->checkTagValue("db_type"), $tagger->checkTagValue("db_conversion")))) {
+			if (($db_type eq "enum" || $db_type eq "set") && $type->{stype} eq "enum") {
+				return "int";
+				return "$db_type(".join(", ", map({
+							$_->getDryTagger()->getTag("db_value")->{value}
+						} @{$type->{literal_list}})).")";
+			}
+			else {
+				if ($db_type =~ m/^(\w+)\((\d+)\)$/) {
+					if (my $sqlt = $SQL_UML_TYPES_VAR{$1}) {
+						return $this->retranslateSqlType("$sqlt($2)", $sqlt, $db_type, $1, $2);
+					}
+					if (my $sqlt = $SQL_UML_TYPES_LOB{$1}) {
+						return $this->retranslateSqlType($sqlt, $sqlt, $db_type, $1, $2);
+					}
+					die "cannot map $db_type";
+				}
+				else {
+					if (my $sqlt = $SQL_UML_TYPES_PRIM{$db_type}) {
+						return $this->retranslateSqlType($sqlt, $sqlt, $db_type, $db_type, undef);
+					}
+					die "cannot map $db_type";
+				}
+			}
+		}
+		else {
+			if ($type->{stype} eq "primitive") {
+				my $ptype = $type->{type};
+				if ($ptype =~ m/^(\w+)\((\d+)\)$/) {
+					if (my $sqlt = $SQL_UML_TYPES_VAR{$1}) {
+						return $this->retranslateSqlType("$sqlt($2)", $sqlt, $ptype, $1, $2);
+					}
+					if (my $sqlt = $SQL_UML_TYPES_LOB{$1}) {
+						return $this->retranslateSqlType($sqlt, $sqlt, $ptype, $1, $2);
+					}
+					die "cannot map $ptype";
+				}
+				else {
+					if (my $sqlt = $SQL_UML_TYPES_PRIM{$ptype}) {
+						return $this->retranslateSqlType($sqlt, $sqlt, $ptype, $ptype, undef);
+					}
+					die "cannot map $ptype";
+				}
+			}
+			elsif ($type->{stype} eq "enum") {
+				return "int";
+			}
+			else {
+				die "unknown stype $type->{stype} for class $type->{full}";
+			}
+		}
+	}
+		or $this->dieAttrContext($field, $@);
+}
+
+sub translateSqlTypeDecl($$)
+{
+	my $this			= shift;
+	my $main			= shift;
+	my $field			= shift;
+
+	my $nullable;
+	my $defaultValue;
+
+	my $sql_type = $this->translateSqlType($field);
+	if (defined (my $doMandatory = $main->checkDryTagValue("doMandatory"))) {
+		$nullable = 0;
+		$defaultValue = $doMandatory;
+	}
+	elsif ($main->{mandatory} eq 0) {
+		$nullable = 1;
+	}
+	elsif ($main->{mandatory} eq 1) {
+		$nullable = 0;
+	}
+	else {
+		$this->dieAttrContext($main, "unexpected mandatory: $main->{mandatory}");
+	}
+	if ($main->checkDryTagValue("serial")) {
+		$sql_type = $this->addSerial($sql_type);
+	}
+	if (!defined $defaultValue) {
+		if (defined (my $db_default = $main->checkDryTagValue("db_default")) && 0) {
+			$defaultValue = $db_default;
+		}
+		elsif (defined (my $default = $main->{default})) {
+			$defaultValue = $default;
+		}
+	}
+	if (defined $defaultValue) {
+		$defaultValue = $this->translateValue($defaultValue);
+	}
+	return $this->formatColumnDef($field, $sql_type, $nullable, $defaultValue);
+}
+
+sub formatColumnDef
+{
+	my $this			= shift;
+	my $field			= shift;
+	my $sqlType			= shift;
+	my $nullable			= shift;
+	my $defaultValue		= shift;
+
+	return $sqlType." ".($nullable ? "NULL" : "NOT NULL").(defined $defaultValue ? " DEFAULT ".$defaultValue : "");
+}
+
+sub addSerial($$)
+{
+	my $this			= shift;
+	my $def				= shift;
+
+	return $def." AUTO_INCREMENT";
+}
+
+sub needExplicitPkOnSerial
+{
+	my $this			= shift;
+	my $hasSerial			= shift;
+
+	return 1;
+}
+
+sub supportsIndex
+{
+	my $this			= shift;
+	my $type			= shift;
+
+	return $type eq "nonunique" ? "" : $type eq "unique " ? "UNIQUE " : $type." ";
+}
+
+sub translateValue
+{
+	my $this			= shift;
+	my $value			= shift;
+
+	if ($value =~ m/^"(.*)"$/) {
+		$value = $1;
+		$value =~ s/\\(.)/$1/gs;
+		$value =~ s/'/''/gs;
+		$value = "'".$value."'";
+	}
+	return $value;
+}
+
+
+package net::dryuf::uml::gensql::adaptor::mysql::Adaptor_mysql;
+
+use strict;
+use warnings;
+
+use base qw(net::dryuf::uml::gensql::adaptor::Adaptor);
+
+use net::dryuf::uml::Util qw(defvalue tabalign);
+
+sub endCreateTable
+{
+	my $this			= shift;
+	my $model			= shift;
+
+	return ") default charset=utf8;\n";
+}
+
+
+package net::dryuf::uml::gensql::adaptor::hsql::Adaptor_hsql;
+
+use strict;
+use warnings;
+
+use base qw(net::dryuf::uml::gensql::adaptor::Adaptor);
+
+use net::dryuf::uml::Util qw(defvalue tabalign);
+
+our %SQL_RETRANSLATE_SIZED = (
+	longblob			=> "longvarbinary",
+);
+
+sub retranslateSqlType
+{
+	my $this			= shift;
+	my $sqlType			= shift;
+	my $sqlBase			= shift;
+	my $umlType			= shift;
+	my $umlBase			= shift;
+	my $typeSize			= shift;
+
+	return exists $SQL_RETRANSLATE_SIZED{$sqlBase} ? $SQL_RETRANSLATE_SIZED{$sqlBase}."(".$typeSize.")" : $sqlType;
+}
+
+sub addSerial($$)
+{
+	my $this			= shift;
+	my $def				= shift;
+
+	return $def." IDENTITY";
+}
+
+sub formatColumnDef
+{
+	my $this			= shift;
+	my $field			= shift;
+	my $sqlType			= shift;
+	my $nullable			= shift;
+	my $defaultValue		= shift;
+
+	return $sqlType." ".(defined $defaultValue ? " DEFAULT ".$defaultValue : "")." ".($nullable ? "NULL" : "NOT NULL");
+}
+
+sub needExplicitPkOnSerial
+{
+	my $this			= shift;
+	my $hasSerial			= shift;
+
+	return 0;
+}
+
+
+package main;
+
+use strict;
+use warnings;
+
+
+sub fixModelInfo($)
+{
+	my $model		= shift;
+
+	if (defined $model->{db_table}) {
+		# ok
+	}
+	elsif (defined (my $db_table = $model->checkDryTagValue("db_table"))) {
+		$model->{db_table} = $db_table;
+	}
+	else {
+		($model->{db_table} = $model->{name}); # =~ s/([[:lower:]])([[:upper:]])/$1_$2/g;
+		#$model->{db_table} = lc($model->{db_table});
+	}
+}
+
+
+net::dryuf::uml::Util::installDryufEnv();
+
+our %opts;
+getopts('ia:t:', \%opts);
+
+die "Usage: $0 -a adaptor [-i] list_file target_file" unless (@ARGV >= 2);
+my $listname = shift(@ARGV);
+my $targname = shift(@ARGV);
+die "passed file $listname does not end with suffix .list" unless ($listname =~ m/(.*)\.(db|list)$/);
+
+exit(0) if (defined $opts{t} && -r $opts{t} && -r $listname && (stat($opts{t}))[9] >= (stat($listname))[9]);
+
+our $file_trans = net::dryuf::uml::FileTransaction->new();
+
+our $model_store = net::dryuf::uml::ModelStore->new();
+$model_store->registerFixier(\&fixModelInfo);
+
+
+sub readModel($$)
+{
+	my $location		= shift;
+	my $name		= shift;
+
+	my $model = $model_store->loadModel($location, $name);
+
+	fixModelInfo($model);
+
+	return $model;
+}
+
+my $lineno = 0;
+
+my @models = ();
+
+my $errors = 0;
+
+my $list = net::dryuf::uml::GenmapReader::open($listname, "sql", @ARGV ? \@ARGV : undef);
+while (my ($section, $classname) = $list->getNext()) {
+	eval {
+		push(@models, readModel($section, $classname));
+		1;
+	}
+		or $errors++, STDERR->print($@ =~ m/^\S+:\d+:/ ? $@ : $list->getContext().": $@");
+}
+
+my $sql = $file_trans->createTruncated($targname);
+my $adaptor = ("net::dryuf::uml::gensql::adaptor::".$opts{a}."::Adaptor_".$opts{a})->new($sql);
+foreach my $model (@models) {
+	my $hasSerial = undef;
+	my @primary;
+	$sql->print($adaptor->startCreateTable($model));
+	my $sqlin = net::dryuf::uml::SepOutput->new($sql, { sep_in => ",", sep_all => "\n" });
+	foreach my $field (@{$model->{field_list}}) {
+		next if ($field->isTransient());
+		eval {
+			if ($field->{stype} eq "field") {
+				$sqlin->printObj("\t".defvalue($field->checkDryTagValue("db_name"), $field->{name}));
+				$sqlin->printAligned($adaptor->translateSqlTypeDecl($field, $field), 40);
+				if ($field->getRole()->{primary}) {
+					push(@primary, $field->{name});
+				}
+				$hasSerial = $field->getDryTagValue("serial") if (defined $field->checkDryTagValue("serial"));
+			}
+			elsif ($field->{stype} eq "assoc" || $field->{stype} eq "compos") {
+				my @assoc = $field->expandAssocAttrs();
+				foreach my $assoc_field (@assoc) {
+					push(@primary, $assoc_field->{name}) if ($field->getRole()->{primary});
+					$sqlin->printObj("\t$assoc_field->{name}");
+					$sqlin->printAligned($adaptor->translateSqlTypeDecl($field, $assoc_field->{field}), 40);
+					$sqlin->printAlignedAdd("-- $assoc_field->{field}->{owner}->{full}.$assoc_field->{field}->{name}", 72);
+				}
+			}
+			elsif ($field->{stype} eq "child") {
+				# ignore childs for db at all
+			}
+			else {
+				net::dryuf::uml::Util::doDie("$field->{owner}->{filename}:0: invalid stype $field->{stype}");
+			}
+			1;
+		}
+			or $errors++, STDERR->print($@);
+	}
+	if (@primary && (!defined $hasSerial || $adaptor->needExplicitPkOnSerial($hasSerial))) {
+		$sqlin->printFlushing("\tprimary key (");
+		my $sqlprim = net::dryuf::uml::SepOutput->new($sql, { sep_in => ", ", sep_all => "" });
+		foreach (@primary) {
+			$sqlprim->printObj($_);
+		}
+		undef $sqlprim;
+		$sqlin->print(")");
+	}
+	undef $sqlin;
+	$sql->print($adaptor->endCreateTable($model));
+
+	foreach my $index ($model->getIndexes()) {
+		$adaptor->formatIndex($model, $index);
+	}
+
+	$sql->print("\n");
+}
+
+die "Unrecoverable errors occurred" if ($errors);
+
+if ($file_trans->commit()) {
+	$file_trans->touch($opts{t}) if (defined $opts{t});
+}

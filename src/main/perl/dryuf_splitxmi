@@ -1,0 +1,306 @@
+#!/usr/bin/perl
+
+#
+# Dryuf framework
+#
+# ----------------------------------------------------------------------------------
+#
+# Copyright (C) 2000-2015 Zbyněk Vyškovský
+#
+# ----------------------------------------------------------------------------------
+#
+# LICENSE:
+#
+# This file is part of Dryuf
+#
+# Dryuf is free software; you can redistribute it and/or modify it under the
+# terms of the GNU Lesser General Public License as published by the Free
+# Software Foundation; either version 3 of the License, or (at your option)
+# any later version.
+#
+# Dryuf is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+# more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Dryuf; if not, write to the Free Software Foundation, Inc., 51
+# Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# @author	2000-2015 Zbyněk Vyškovský
+# @link		mailto:kvr@matfyz.cz
+# @link		http://kvr.matfyz.cz/software/java/dryuf/
+# @link		http://github.com/dryuf/
+# @license	http://www.gnu.org/licenses/lgpl.txt GNU Lesser General Public License v3
+#
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Data::Dumper;
+use Getopt::Std;
+use File::Path;
+
+use File::Basename;
+use DB_File;
+use lib dirname($0)."/perl";
+use net::dryuf::uml::XmiParser;
+use net::dryuf::uml::FileTransaction;
+use net::dryuf::uml::Util qw(tabalign escapeString unescapeString);
+
+our %opts;
+our $xmi_fname;
+our $dst_dir;
+our $file_trans;
+our %gen_map;
+our $gen_idx = 0;
+
+sub openClassFile($$)
+{
+	my $xmi			= shift;
+	my $class		= shift;
+
+	my $name = $xmi->getFullName($class);
+	my $fname = $name; $fname =~ s/::/\//g;
+	$fname = "$dst_dir/$fname";
+	mkpath(dirname($fname));
+	return $file_trans->updateChanged("$fname.clsdef");
+}
+
+sub formatPair($$)
+{
+	my $p0			= shift;
+	my $p1			= shift;
+
+	net::dryuf::uml::Util::doDie("p0 undefined") unless (defined $p0);
+	net::dryuf::uml::Util::doDie("p1 undefined") unless (defined $p1);
+
+	return tabalign($p0, 32).$p1."\n";
+}
+
+sub formatTriplet($$$)
+{
+	my $p0			= shift;
+	my $p1			= shift;
+	my $p2			= shift;
+
+	net::dryuf::uml::Util::doDie("p0 undefined") unless (defined $p0);
+	net::dryuf::uml::Util::doDie("p1 undefined") unless (defined $p1);
+	net::dryuf::uml::Util::doDie("p2 undefined") unless (defined $p2);
+
+	return tabalign(tabalign($p0, 32).$p1, 64).$p2."\n";
+}
+
+sub formatComment($$)
+{
+	my $indent		= shift;
+	my $comment		= shift;
+
+	my $out = "";
+
+	foreach my $dry (sort({ $a->{order} <=> $b->{order} } @{$comment->{drytag_list}})) {
+		$out .= sprintf("%s%s", "\t" x $indent, formatTriplet("drytag", $dry->{name}, escapeString($dry->{value})));
+	}
+	foreach my $com (@{$comment->{comment}}) {
+		$out .= sprintf("%s%s", "\t" x $indent, formatPair("comment", escapeString($com)));
+	}
+	return $out;
+}
+
+sub formatClassComment($$)
+{
+	my $indent		= shift;
+	my $classdef		= shift;
+
+	my $out = "";
+
+	my %drytags = ();
+
+	foreach my $dry (sort({ $a->{order} <=> $b->{order} } @{$classdef->{comment}->{drytag_list}})) {
+		$out .= sprintf("%s%s", "\t" x $indent, formatTriplet("drytag", $dry->{name}, escapeString($dry->{value})));
+		$drytags{$dry->{name}} = 1;
+	}
+	for (my $package = $classdef->{parent}; $package; $package = $package->{parent}) {
+		next if ($package->{type} ne "package");
+		foreach my $dry (sort({ $a->{order} <=> $b->{order} } @{$package->{comment}->{drytag_list}})) {
+			next if ($drytags{$dry->{name}});
+			$out .= sprintf("%s%s", "\t" x $indent, formatTriplet("drytag", $dry->{name}, escapeString($dry->{value})));
+			$drytags{$dry->{name}} = 1;
+		}
+	}
+	foreach my $com (@{$classdef->{comment}->{comment}}) {
+		$out .= sprintf("%s%s", "\t" x $indent, formatPair("comment", escapeString($com)));
+	}
+	return $out;
+}
+
+sub genClass
+{
+	my $xmi			= shift;
+	my $class		= shift;
+
+	my $fd = openClassFile($xmi, $class);
+
+	$fd->print(formatPair("package", $xmi->getPrefixName($class)));
+	$fd->print(formatPair("name", $class->{name}));
+	$fd->print(formatPair("stype", $class->{type}));
+	if (defined $class->{ancestor}) {
+		$fd->print(formatPair("ancestor", $xmi->formatDatatype($class->{ancestor})));
+	}
+	if (@{$class->{implements}}) {
+		$fd->print(formatPair("implements", join(" ", map({ $xmi->formatDatatype($xmi->resolveDatatype($_->{supplier})); } @{$class->{implements}}))));
+	}
+	$fd->print(formatClassComment(0, $class));
+	foreach my $nested (@{$class->{class_list}}) {
+		next if ($nested->{comment}->{drytag_hash}->{disabled});
+		$fd->print(formatPair("nested", $nested->{name}));
+	}
+	if ($class->{type} eq "typedef") {
+		$fd->print(formatPair("base", $xmi->formatDatatype($class->getTypedefSource())));
+	}
+	elsif ($class->{type} eq "enum") {
+		foreach my $literal (@{$class->{literal_list}}) {
+			$fd->print(formatPair("enum", $literal->{name}));
+			$fd->print(formatComment(1, $literal->{comment}));
+			if (defined $literal->{default}) {
+				$fd->print("\t".formatPair("value", $literal->{default}));
+			}
+		}
+	}
+	elsif ($class->{type} eq "class" || $class->{type} eq "association") {
+		foreach my $field (@{$class->{field_list}}) {
+			next if ($field->{comment}->{drytag_hash}->{disabled});
+			if (!defined $field->{association_xid}) {
+				$fd->print(formatPair("field", $field->{name}));
+				$fd->print("\t".formatPair("type", $xmi->formatDatatype($class->getAttrType($field))));
+			}
+			elsif ($field->{aggregation} eq "composite") {
+				$fd->print(formatPair("compos", $field->{name}));
+				$fd->print("\t".formatPair("ref", $xmi->formatDatatype($class->getAttrType($field))));
+			}
+			elsif ($field->{aggregation} eq "child") {
+				$fd->print(formatPair("child", $field->{name}));
+				$fd->print("\t".formatPair("ref", $xmi->formatDatatype($class->getAttrType($field))));
+			}
+			elsif ($field->{aggregation} eq "none") {
+				$fd->print(formatPair("assoc", $field->{name}));
+				$fd->print("\t".formatPair("ref", $xmi->formatDatatype($class->getAttrType($field))));
+			}
+			else {
+				die "unknown aggregation type for ".$xmi->getFullName($class).".$field->{name}: $field->{aggregation}";
+			}
+			$fd->print("\t".formatPair("mandatory", $field->{mandatory}));
+			$fd->print("\t".formatPair("default", $field->{default_value})) if (defined $field->{default_value});
+			$fd->print(formatComment(1, $field->{comment}));
+		}
+		my %oper_printed = ();
+		foreach my $action (grep({ $_->{name} =~ m/^dry\.action\.(.*)$/ } @{$class->{oper_list}})) {
+			$oper_printed{$action->{name}} = 1;
+			my $action_name = ($action->{name} =~ m/^dry\.action\.(.*)$/)[0];
+			$fd->print(formatPair("action", $action_name));
+			$fd->print("\t".formatPair("classify", join(",", keys %{$action->{classify}})));
+			$fd->print(formatComment(1, $action->{comment}));
+		}
+		foreach my $view (grep({ $_->{name} =~ m/^dry\.view\.(.*)$/ } @{$class->{oper_list}})) {
+			$oper_printed{$view->{name}} = 1;
+			my $action_name = ($view->{name} =~ m/^dry\.view\.(.*)$/)[0];
+			$fd->print(formatPair("view", $action_name));
+			$fd->print(formatComment(1, $view->{comment}));
+		}
+		foreach my $oper (grep({ !$oper_printed{$_->{name}} } @{$class->{oper_list}})) {
+			$fd->print(formatPair("oper", $oper->{name}));
+			$fd->print(formatComment(1, $oper->{comment}));
+			$fd->print("\t".formatPair("classify", join(",", keys %{$oper->{classify}})));
+			net::dryuf::uml::Util::doDie("returntype not specified for $oper->{name}") unless (defined $oper->{returntype});
+			$fd->print("\t".formatPair("return", $xmi->formatDatatype($class->getElementType($oper->{returntype}))));
+			foreach my $par (@{$oper->{param_list}}) {
+				$fd->print("\t".formatPair("param", $par->{name}));
+				$fd->print("\t\t".formatPair("type", $xmi->formatDatatype($class->getElementType($par))));
+				$fd->print("\t\t".formatPair("direction", $par->{direction}));
+			}
+		}
+	}
+	else {
+		die "unknown type for class ".$xmi->getFullName($class).": $class->{type}";
+	}
+	$file_trans->closeFile($fd);
+
+	foreach my $ch_class (@{$class->{class_list}}) {
+		genClass($xmi, $ch_class);
+	}
+	if (defined (my $genlist = $class->{comment}->{drytag_hash}{gen}->{value})) {
+		foreach my $genid (split(/,\s*/, $genlist)) {
+			$gen_map{$genid."\t".sprintf("%09d", ++$gen_idx)."\t".$xmi->getPrefixName($class)."::".$class->{name}} = $genlist;
+		}
+	}
+}
+
+sub genPackage
+{
+	my $xmi			= shift;
+	my $package		= shift;
+
+	return if (!$package->{name});
+	my $location = $xmi->getFullName($package); $location =~ s/::/\//g;
+	if ($location !~ /^(\w+)(\/(\w+))*$/) {
+		die "invalid package name: ".$xmi->getFullName($package);
+	}
+	$location = "$dst_dir/$location";
+	mkpath($location);
+	$location .= "/";
+
+	foreach my $obj (@{$package->{class_list}}) {
+		genClass($xmi, $obj);
+	}
+}
+
+sub genObject
+{
+	my $xmi			= shift;
+	my $obj			= shift;
+
+	if ($obj->{type} eq "class") {
+		genClass($xmi, $obj);
+	}
+	elsif ($obj->{type} eq "package") {
+		genPackage($xmi, $obj);
+	}
+	else {
+		#print(Dumper($obj));
+		die "unknown object type for $obj->{fullname}: $obj->{type}";
+	}
+}
+
+
+net::dryuf::uml::Util::installDryufEnv();
+
+getopts('t:', \%opts);
+
+die "Usage: $0 xmi_file target_dir" unless (@ARGV == 2);
+$xmi_fname = shift(@ARGV);
+$dst_dir = shift(@ARGV);
+
+exit(0) if (defined $opts{t} && -r $opts{t} && -r $xmi_fname && (stat($opts{t}))[9] >= (stat($xmi_fname))[9]);
+
+$file_trans = net::dryuf::uml::FileTransaction->new();
+$file_trans->mkdir($dst_dir);
+tie(%gen_map, 'DB_File', "$dst_dir/_genmap.db", O_CREAT|O_RDWR|O_TRUNC, 0666, $DB_BTREE)
+	or net::dryuf::uml::Util::doDie("failed to open $dst_dir/_genmap.db");
+
+my $xmi = net::dryuf::uml::XmiParser->new($xmi_fname);
+
+foreach my $package (@{$xmi->{packages}}) {
+	genPackage($xmi, $package);
+}
+
+if ($file_trans->commit()) {
+	untie(%gen_map)
+		or net::dryuf::uml::Util::doDie("failed to flush $dst_dir/_genmap.db");
+	my $dummy = FileHandle->new("$dst_dir/_gen.gen", ">");
+	$dummy->printf("ok\n");
+	if (!$dummy->close()) {
+		die "failed to update dummy file $dst_dir/_gen.gen: $!";
+	}
+	$file_trans->touch($opts{t}) if (defined $opts{t});
+}
