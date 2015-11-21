@@ -37,6 +37,8 @@ package net::dryuf::uml::TagWriter;
 use strict;
 use warnings;
 
+use Data::Dumper;
+
 sub new
 {
 	my $class = shift; $class = ref($class) || $class;
@@ -66,7 +68,7 @@ sub getBaseFilename
 	my $this			= shift;
 	my $filename			= shift;
 
-	return substr($filename, length($this->{basePath}));
+	return index($filename, $this->{basePath}) == 0 ? substr($filename, length($this->{basePath})) : $filename;
 }
 
 sub flush

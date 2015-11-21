@@ -197,12 +197,12 @@ sub printPrimitiveAnnotations($$$$$$$)
 	my $tagger			= shift;
 	my $javaType			= shift;
 
-	if (defined (my $logical = $tagger->checkTagValue("logical"))) {
-		$javaOut->printSysimport("import net.dryuf.logical.LogicalUse;\n");
-		$printCtx->print("\@LogicalUse(logical = ".convertToJavaClass($logical).".class)\n");
+	if (defined (my $textual = $tagger->checkTagValue("textual"))) {
+		$javaOut->printSysimport("import net.dryuf.textual.TextualUse;\n");
+		$printCtx->print("\@TextualUse(textual = ".convertToJavaClass($textual).".class)\n");
 	}
 	if (defined (my $display = $tagger->checkTagValue("display"))) {
-		$javaOut->printSysimport("import net.dryuf.logical.DisplayUse;\n");
+		$javaOut->printSysimport("import net.dryuf.textual.DisplayUse;\n");
 		my $displayAdd = "";
 		#if ($field->{stype} eq "assoc") {
 		#	$displayAdd .= ", refClass = ".$field->getAssocTarget()->getFullDotName().".class";
@@ -698,7 +698,7 @@ sub generateEntityBean($$$$)
 
 	my $model = $context->{model_store}->loadModel($location, $classname);
 
-	my $fdbean = $context->{file_trans}->updateChanged($context->{dst_dir}."/java/$filename.java");
+	my $fdbean = $context->{file_trans}->updateChanged($context->{dst_dir}."/$filename.java");
 	my $writer = $fdbean->rememberContext();
 	$context->{processed}->{$filename} = 1;
 
@@ -769,7 +769,7 @@ sub generateEntityDaoIf($$$$)
 	my $model = $context->{model_store}->loadModel($location, $classname);
 	my $dao = $model->checkSubModel("${classname}::Dao");
 
-	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/java/$filename.java");
+	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/$filename.java");
 	$context->{processed}->{$filename} = 1;
 
 	$fddao->print("package $pkgname.dao;\n\n");
@@ -870,7 +870,7 @@ sub generateEntityDaoHib($$$$)
 	my $model = $context->{model_store}->loadModel($location, $classname);
 	my $dao = $model->checkSubModel("${classname}::Dao");
 
-	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/java".net::dryuf::uml::Util::prependFile("/$filename.java", "hibdao/"));
+	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}.net::dryuf::uml::Util::prependFile("/$filename.java", "hibdao/"));
 	$context->{processed}->{$filename} = 1;
 
 	$fddao->print("package $pkgname;\n\n");
@@ -1086,7 +1086,7 @@ sub generateEntityDaoJpa($$$$)
 
 	my $pkclassname = net::dryuf::uml::prog::java::JavaGenerator::getPkTypeName($model);
 
-	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}."/java".net::dryuf::uml::Util::prependFile("/$filename.java", "jpadao/"));
+	my $fddao = $context->{file_trans}->updateChanged($context->{dst_dir}.net::dryuf::uml::Util::prependFile("/$filename.java", "jpadao/"));
 	$context->{processed}->{$filename} = 1;
 
 	$fddao->print("package $pkgname;\n\n");

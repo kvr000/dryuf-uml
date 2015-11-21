@@ -1,0 +1,143 @@
+#!/usr/bin/perl
+
+#
+# Dryuf framework
+#
+# ----------------------------------------------------------------------------------
+#
+# Copyright (C) 2000-2015 Zbyněk Vyškovský
+#
+# ----------------------------------------------------------------------------------
+#
+# LICENSE:
+#
+# This file is part of Dryuf
+#
+# Dryuf is free software; you can redistribute it and/or modify it under the
+# terms of the GNU Lesser General Public License as published by the Free
+# Software Foundation; either version 3 of the License, or (at your option)
+# any later version.
+#
+# Dryuf is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for
+# more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Dryuf; if not, write to the Free Software Foundation, Inc., 51
+# Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# @author	2000-2015 Zbyněk Vyškovský
+# @link		mailto:kvr@matfyz.cz
+# @link		http://kvr.matfyz.cz/software/java/dryuf/
+# @link		http://github.com/dryuf/
+# @license	http://www.gnu.org/licenses/lgpl.txt GNU Lesser General Public License v3
+#
+
+use strict;
+use warnings;
+
+use File::Basename;
+use lib dirname($0)."/perl";
+
+
+package net::dryuf::uml::FilterXmi;
+
+use XML::LibXML;
+use Data::Dumper;
+
+use net::dryuf::uml::Util;
+
+sub new
+{
+	my $ref = shift;
+
+	return bless {
+		filtered		=> undef,
+		ids			=> {},
+	}, $ref;
+}
+
+sub processPackage
+{
+	my ( $this, $pkg, $fullname, $included ) = @_;
+
+	if (!$included && exists $this->{filtered}->{$fullname}) {
+		$included = 1;
+		$this->{ids}->{$_->textContent()} = 1 foreach ($pkg->findnodes("//\@xmi:idref"));
+	}
+	my $childIncluded = $included;
+	foreach my $sub ($pkg->findnodes("packagedElement[\@xmi:type='uml:Package' or \@xmi:type='uml:Class']")) {
+		$childIncluded = 1 if ($this->processPackage($sub, $fullname.".".$sub->getAttribute("name"), $included));
+	}
+	$pkg->unbindNode() if (!$childIncluded);
+	return $childIncluded;
+}
+
+sub processDataTypes
+{
+	my ( $this, $uml ) = @_;
+
+	foreach my $dataType ($uml->findnodes("packagedElement[\@xmi:type='uml:DataType']")) {
+		unless (exists $this->{ids}->{$dataType->getAttribute("xmi:id")}) {
+			$dataType->nextSibling()->unbindNode() if ($dataType->nextSibling() && $dataType->nextNonBlankSibling() && $dataType->nextSibling() != $dataType->nextNonBlankSibling());
+			$dataType->unbindNode();
+		}
+	}
+}
+
+sub processStatic
+{
+	my ( $this, $uml, $root ) = @_;
+
+	$uml->setAttribute("name", $this->{project});
+	$root->setAttribute("name", $this->{project});
+
+	$_->setAttribute("value", $this->{project}."/".$this->{project}.".xmi") foreach ($root->findnodes("xmi:Extension/taggedValue[\@tag='gxmi path']"));
+}
+
+sub run
+{
+	my ( $this ) = shift;
+
+	if (@ARGV == 0 || $ARGV[0] eq "-h") {
+		STDERR->print("Usage: $0 project-name package-list... < xmi-file > output-xmi\n");
+		return 125;
+	}
+
+	$this->{project} = shift @ARGV;
+	$this->{filtered} = { map({ $_ => 1 } @ARGV) };
+
+	my $doc = XML::LibXML->load_xml(IO => \*STDIN);
+
+	my $uml = findOneNode($doc, "/xmi:XMI/uml:Model");
+	my $root = findOneNode($uml, "packagedElement[\@xmi:type='uml:Package']");
+
+	$this->processPackage($_, $_->getAttribute("name"), 0) foreach ($root->findnodes("packagedElement"));
+	$this->processDataTypes($uml);
+
+	$this->processStatic($uml, $root);
+
+	$doc->toFH(\*STDOUT, 0)
+		or die "Failed to write resulting XMI: $!";
+
+	return 0;
+}
+
+sub findOneNode
+{
+	my ( $node, $path ) = @_;
+
+	my @nodes = $node->findnodes($path);
+	die "not exactly one node for $path: ".@nodes if (@nodes != 1);
+	return $nodes[0];
+}
+
+sub main
+{
+	net::dryuf::uml::Util::installDryufEnv();
+	exit(net::dryuf::uml::FilterXmi->new()->run());
+}
+
+
+net::dryuf::uml::FilterXmi::main(@ARGV);

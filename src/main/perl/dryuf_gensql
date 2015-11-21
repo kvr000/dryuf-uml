@@ -342,6 +342,14 @@ sub retranslateSqlType
 	return exists $SQL_RETRANSLATE_SIZED{$sqlBase} ? $SQL_RETRANSLATE_SIZED{$sqlBase}."(".$typeSize.")" : $sqlType;
 }
 
+sub startCreateTable
+{
+	my $this			= shift;
+	my $model			= shift;
+
+	return "CREATE TABLE IF NOT EXISTS $model->{db_table} (\n";
+}
+
 sub addSerial($$)
 {
 	my $this			= shift;
@@ -358,6 +366,8 @@ sub formatColumnDef
 	my $nullable			= shift;
 	my $defaultValue		= shift;
 
+	$defaultValue = $1 if (defined $defaultValue && $defaultValue =~ m/^([0-9.].*)f$/i);
+
 	return $sqlType." ".(defined $defaultValue ? " DEFAULT ".$defaultValue : "")." ".($nullable ? "NULL" : "NOT NULL");
 }
 
@@ -367,6 +377,22 @@ sub needExplicitPkOnSerial
 	my $hasSerial			= shift;
 
 	return 0;
+}
+
+sub formatIndex
+{
+	my $this			= shift;
+	my $model			= shift;
+	my $index			= shift;
+
+	if (defined (my $type = $this->supportsIndex($index->{type}))) {
+		$this->{out}->print("DROP INDEX IF EXISTS $model->{name}_$index->{name};\n");
+		$this->{out}->print("CREATE ${type}INDEX $model->{name}_$index->{name} ON $model->{name} (\n");
+		my $sqlind = net::dryuf::uml::SepOutput->new($this->{out}, { sep_in => ", ", sep_all => "\n" });
+		$sqlind->printObj("\t".$_) foreach (@{$index->{fields}});
+		undef $sqlind;
+		$this->{out}->print(");\n");
+	}
 }
 
 

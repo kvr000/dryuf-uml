@@ -40,6 +40,7 @@ use warnings;
 use File::Basename;
 use lib dirname($0)."/perl";
 use File::Find;
+use Getopt::Std;
 use Data::Dumper;
 use net::dryuf::uml::Util;
 use net::dryuf::uml::FileParser;
@@ -67,7 +68,12 @@ sub find_checkName
 
 net::dryuf::uml::Util::installDryufEnv();
 
+our %opts;
+getopts('C:', \%opts);
+
 die "Usage: $0 index-file directories" unless (@ARGV >= 1);
+
+chdir($opts{C}) or die "Failed to change directory to $opts{C}: $!" if (defined $opts{C});
 
 our $file_trans = net::dryuf::uml::FileTransaction->new();
 my $idx_name = shift @ARGV;
@@ -85,7 +91,7 @@ foreach (@fnames) {
 	my $finfo = { file => $_, classes => [], deps => [] };
 	my $fp = net::dryuf::uml::FileParser->new($_);
 	while (defined (my $l = $fp->readLine())) {
-		if ($l =~ m/^(.*=\s*|\(function\(\)|)net\.dryuf\.core\.Dryuf\.registerClass\("([^"]+)",\s*(null|"([^"]+)")(\)|,).*$/) {
+		if ($l =~ m/^(.*=\s*|\(function\(\)|)net\.dryuf\.registerClass\("([^"]+)",\s*(null|"([^"]+)")(\)|,).*$/) {
 			chomp $l;
 			my $cld = { context => createContext($fp, $l), class => $2, ancestor => defined $4 ? $4 : undef, ifaces => [] };
 			push(@{$finfo->{classes}}, $cld->{class});
