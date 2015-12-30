@@ -41,7 +41,6 @@ use warnings;
 
 use FileHandle;
 use Data::Dumper;
-use Getopt::Std;
 use File::Basename;
 
 use lib dirname($0)."/perl";
@@ -51,7 +50,7 @@ use net::dryuf::uml::ModelStore;
 use net::dryuf::uml::GenmapReader;
 use net::dryuf::uml::Util qw(defvalue tabalign);
 
-package net::dryuf::uml::gensql::adaptor::Adaptor;
+package net::dryuf::uml::gensql::adaptor::GenericAdaptor;
 
 use strict;
 use warnings;
@@ -257,7 +256,7 @@ sub formatColumnDef
 	my $nullable			= shift;
 	my $defaultValue		= shift;
 
-	return $sqlType." ".($nullable ? "NULL" : "NOT NULL").(defined $defaultValue ? " DEFAULT ".$defaultValue : "");
+	return $sqlType." ".($nullable ? "NULL" : "NOT NULL").(defined $defaultValue ? " DEFAULT ".$this->translateValue($defaultValue) : "");
 }
 
 sub addSerial($$)
@@ -295,16 +294,19 @@ sub translateValue
 		$value =~ s/'/''/gs;
 		$value = "'".$value."'";
 	}
+	elsif ($value =~ m/^([0-9]*\.[0-9]*)f/) {
+		$value = $1;
+	}
 	return $value;
 }
 
 
-package net::dryuf::uml::gensql::adaptor::mysql::Adaptor_mysql;
+package net::dryuf::uml::gensql::adaptor::mysql::MysqlAdaptor;
 
 use strict;
 use warnings;
 
-use base qw(net::dryuf::uml::gensql::adaptor::Adaptor);
+use base qw(net::dryuf::uml::gensql::adaptor::GenericAdaptor);
 
 use net::dryuf::uml::Util qw(defvalue tabalign);
 
@@ -316,13 +318,26 @@ sub endCreateTable
 	return ") default charset=utf8;\n";
 }
 
+sub formatColumnDef
+{
+	my $this			= shift;
+	my $field			= shift;
+	my $sqlType			= shift;
+	my $nullable			= shift;
+	my $defaultValue		= shift;
 
-package net::dryuf::uml::gensql::adaptor::hsql::Adaptor_hsql;
+	$defaultValue = $1 if (defined $defaultValue && $defaultValue =~ m/^([0-9.].*)f$/i);
+
+	return $sqlType." ".(defined $defaultValue ? " DEFAULT ".$defaultValue : "")." ".($nullable ? "NULL" : "NOT NULL");
+}
+
+
+package net::dryuf::uml::gensql::adaptor::hsql::HsqlAdaptor;
 
 use strict;
 use warnings;
 
-use base qw(net::dryuf::uml::gensql::adaptor::Adaptor);
+use base qw(net::dryuf::uml::gensql::adaptor::GenericAdaptor);
 
 use net::dryuf::uml::Util qw(defvalue tabalign);
 
@@ -366,9 +381,7 @@ sub formatColumnDef
 	my $nullable			= shift;
 	my $defaultValue		= shift;
 
-	$defaultValue = $1 if (defined $defaultValue && $defaultValue =~ m/^([0-9.].*)f$/i);
-
-	return $sqlType." ".(defined $defaultValue ? " DEFAULT ".$defaultValue : "")." ".($nullable ? "NULL" : "NOT NULL");
+	return $sqlType." ".(defined $defaultValue ? " DEFAULT ".$this->translateValue($defaultValue) : "")." ".($nullable ? "NULL" : "NOT NULL");
 }
 
 sub needExplicitPkOnSerial
@@ -396,10 +409,63 @@ sub formatIndex
 }
 
 
-package main;
+package net::dryuf::uml::gensql::adaptor::sqlite::SqliteAdaptor;
 
 use strict;
 use warnings;
+
+use base qw(net::dryuf::uml::gensql::adaptor::GenericAdaptor);
+
+use net::dryuf::uml::Util qw(defvalue tabalign);
+
+sub startCreateTable
+{
+	my $this			= shift;
+	my $model			= shift;
+
+	return "CREATE TABLE IF NOT EXISTS $model->{db_table} (\n";
+}
+
+sub addSerial($$)
+{
+	my $this			= shift;
+	my $def				= shift;
+
+	return $def." IDENTITY";
+}
+
+sub needExplicitPkOnSerial
+{
+	my $this			= shift;
+	my $hasSerial			= shift;
+
+	return 0;
+}
+
+sub formatIndex
+{
+	my $this			= shift;
+	my $model			= shift;
+	my $index			= shift;
+
+	if (defined (my $type = $this->supportsIndex($index->{type}))) {
+		$this->{out}->print("DROP INDEX IF EXISTS $model->{name}_$index->{name};\n");
+		$this->{out}->print("CREATE ${type}INDEX $model->{name}_$index->{name} ON $model->{name} (\n");
+		my $sqlind = net::dryuf::uml::SepOutput->new($this->{out}, { sep_in => ", ", sep_all => "\n" });
+		$sqlind->printObj("\t".$_) foreach (@{$index->{fields}});
+		undef $sqlind;
+		$this->{out}->print(");\n");
+	}
+}
+
+
+package net::dryuf::uml::gensql::core::Main;
+
+use strict;
+use warnings;
+
+use Getopt::Std;
+use net::dryuf::uml::Util qw(defvalue tabalign);
 
 
 sub fixModelInfo($)
@@ -465,7 +531,7 @@ while (my ($section, $classname) = $list->getNext()) {
 }
 
 my $sql = $file_trans->createTruncated($targname);
-my $adaptor = ("net::dryuf::uml::gensql::adaptor::".$opts{a}."::Adaptor_".$opts{a})->new($sql);
+my $adaptor = ("net::dryuf::uml::gensql::adaptor::".$opts{a}."::".ucfirst($opts{a})."Adaptor")->new($sql);
 foreach my $model (@models) {
 	my $hasSerial = undef;
 	my @primary;
